@@ -37,6 +37,10 @@ def export_session(store: TranscriptStore, output_dir: Path) -> None:
 
     speakers_dir = output_dir / "speakers"
     speakers_dir.mkdir(exist_ok=True)
+    used_filenames: dict[str, int] = {}
     for name, texts in per_speaker.items():
         safe_name = sanitize_name_component(name) or "Speaker"
-        (speakers_dir / f"{safe_name}.txt").write_text("\n".join(texts), encoding="utf-8")
+        count = used_filenames.get(safe_name, 0)
+        used_filenames[safe_name] = count + 1
+        filename = f"{safe_name}.txt" if count == 0 else f"{safe_name}_{count + 1}.txt"
+        (speakers_dir / filename).write_text("\n".join(texts), encoding="utf-8")
