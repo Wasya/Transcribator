@@ -1,13 +1,13 @@
 import argparse
 import os
-import re
 import threading
-from datetime import datetime
 
 import httpx
 from deepgram import DeepgramClient
 from deepgram.core.events import EventType
 from dotenv import load_dotenv
+
+from naming import build_timestamped_name, NAME_MAX_LENGTH
 
 load_dotenv()
 
@@ -16,21 +16,9 @@ DEEPGRAM_API_KEY = os.environ["DEEPGRAM_API_KEY"]
 # Note: This is an English stream, update accordingly for other languages
 STREAM_URL = "https://playerservices.streamtheworld.com/api/livestream-redirect/CSPANRADIOAAC.aac"
 
-# Символы, недопустимые в имени файла в Windows, плюс управляющие символы
-INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-OUTFILE_NAME_MAX_LENGTH = 20
-
 
 def build_output_filename(out_file: str | None) -> str:
-    timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M")
-
-    if out_file:
-        prefix = INVALID_FILENAME_CHARS.sub("", out_file)[:OUTFILE_NAME_MAX_LENGTH]
-    else:
-        prefix = "DeepGram"
-
-    return f"{prefix}{timestamp}.txt"
+    return f"{build_timestamped_name(out_file, 'DeepGram')}.txt"
 
 
 def parse_args():
@@ -40,7 +28,7 @@ def parse_args():
         dest="out_file",
         default=None,
         help="Имя выходного файла (очищается от недопустимых символов, "
-        f"обрезается до {OUTFILE_NAME_MAX_LENGTH} символов и дополняется датой/временем)",
+        f"обрезается до {NAME_MAX_LENGTH} символов и дополняется датой/временем)",
     )
     return parser.parse_args()
 
