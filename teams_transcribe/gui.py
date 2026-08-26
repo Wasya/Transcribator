@@ -27,7 +27,7 @@ class App(tk.Tk):
         self._session: TranscriptionSession | None = None
         self._muted = False
         self._speaker_rows: dict[tuple, tk.Entry] = {}
-        self._interim_line_start: str | None = None
+        self._interim_marks: dict[tuple, str] = {}
 
         self._output_dir: Path | None = None
 
@@ -99,6 +99,14 @@ class App(tk.Tk):
         if not self._mic_devices or not self._system_devices:
             messagebox.showerror("Ошибка", "Не найдено устройство микрофона или системного звука.")
             return
+
+        for child in list(self.speakers_container.winfo_children()):
+            child.destroy()
+        self._speaker_rows.clear()
+        self._interim_marks.clear()
+        self._muted = False
+        self.mute_button.config(text="Заглушить микрофон")
+
         mic = self._mic_devices[self.mic_combo.current()]
         system = self._system_devices[self.system_combo.current()]
         language = LANGUAGES[self.lang_combo.current()][1]
@@ -115,6 +123,7 @@ class App(tk.Tk):
         try:
             self._session.start()
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            self._session.stop()
             messagebox.showerror("Ошибка подключения к Deepgram", str(exc))
             self._session = None
             return
@@ -180,16 +189,27 @@ class App(tk.Tk):
 
     def _update_transcript(self, event) -> None:
         self.transcript_box.config(state="normal")
-        if self._interim_line_start is not None:
-            self.transcript_box.delete(self._interim_line_start, "end")
-            self._interim_line_start = None
 
-        line = f"{event.speaker_name}: {event.text}\n"
-        if event.is_final:
-            self.transcript_box.insert("end", line)
+        text = f"{event.speaker_name}: {event.text}"
+        mark = self._interim_marks.get(event.speaker_key)
+        if mark is not None:
+            # This speaker already has an in-progress line: replace just that
+            # line's content in place (never touching the line's own trailing
+            # newline), so other speakers' concurrently-updated lines are
+            # untouched and marks never collide at the same buffer index.
+            self.transcript_box.delete(f"{mark} linestart", f"{mark} lineend")
+            self.transcript_box.insert(f"{mark} linestart", text)
+            if event.is_final:
+                self.transcript_box.mark_unset(mark)
+                del self._interim_marks[event.speaker_key]
         else:
-            self._interim_line_start = self.transcript_box.index("end-1c")
-            self.transcript_box.insert("end", line)
+            insert_pos = self.transcript_box.index("end-1c")
+            self.transcript_box.insert("end", text + "\n")
+            if not event.is_final:
+                mark_name = f"interim_{event.speaker_key[0]}_{event.speaker_key[1]}"
+                self.transcript_box.mark_set(mark_name, insert_pos)
+                self.transcript_box.mark_gravity(mark_name, "left")
+                self._interim_marks[event.speaker_key] = mark_name
 
         self.transcript_box.see("end")
         self.transcript_box.config(state="disabled")
