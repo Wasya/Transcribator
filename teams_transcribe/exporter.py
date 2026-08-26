@@ -8,7 +8,7 @@ from teams_transcribe.transcript_store import TranscriptStore
 def export_session(store: TranscriptStore, output_dir: Path) -> None:
     """Write transcript.txt, transcript.json and speakers/<Имя>.txt into output_dir."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    utterances = store.final_utterances()
+    utterances = sorted(store.final_utterances(), key=lambda u: u.timestamp)
 
     txt_lines: list[str] = []
     json_entries: list[dict] = []

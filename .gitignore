@@ -3,6 +3,11 @@
 __pycache__/
 *.pyc
 
-# Session output (ListenSteam.py / TeamsTranscribe.py transcripts, generated at runtime)
+# Session output (ListenSteam.py / TeamsTranscribe.py transcripts, generated at runtime).
+# Any session folder ends in the DD-MM-YYYY_HH-MM timestamp suffix, regardless
+# of prefix (default "DeepGramMeeting" or a custom "Имя сессии" from the GUI),
+# and rapid restarts may add a _2/_3/... disambiguator, so match that too.
 DeepGram[0-9][0-9]-*.txt
 DeepGramMeeting[0-9][0-9]-*/
+/*[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]_[0-9][0-9]-[0-9][0-9]/
+/*[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9]_[0-9][0-9]-[0-9][0-9]_[0-9]*/

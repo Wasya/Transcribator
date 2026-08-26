@@ -36,6 +36,7 @@ class App(tk.Tk):
         self._system_devices = list_loopback_devices(self._pa)
 
         self._build_widgets()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         messagebox.showinfo("Перед началом", CONSENT_NOTICE)
 
     def _build_widgets(self) -> None:
@@ -95,6 +96,21 @@ class App(tk.Tk):
         self.speakers_container = ttk.Frame(speakers_frame)
         self.speakers_container.pack(fill="y")
 
+    @staticmethod
+    def _resolve_output_dir(base_name: str) -> Path:
+        """Return a Path for base_name, disambiguated with a _2, _3, ... suffix
+        if a non-empty directory of that name already exists (minute-granularity
+        timestamps in build_timestamped_name can collide on rapid restart)."""
+        candidate = Path(base_name)
+        if not candidate.exists() or not any(candidate.iterdir()):
+            return candidate
+        n = 2
+        while True:
+            candidate = Path(f"{base_name}_{n}")
+            if not candidate.exists() or not any(candidate.iterdir()):
+                return candidate
+            n += 1
+
     def _on_start(self) -> None:
         if not self._mic_devices or not self._system_devices:
             messagebox.showerror("Ошибка", "Не найдено устройство микрофона или системного звука.")
@@ -113,7 +129,7 @@ class App(tk.Tk):
         record_audio = self.record_wav_var.get()
 
         session_name = build_timestamped_name(self.session_name_var.get(), "DeepGramMeeting")
-        self._output_dir = Path(session_name)
+        self._output_dir = self._resolve_output_dir(session_name)
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
         self._session = TranscriptionSession(
@@ -123,7 +139,12 @@ class App(tk.Tk):
         try:
             self._session.start()
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
-            self._session.stop()
+            try:
+                self._session.stop()
+            except Exception:
+                # Best-effort teardown of a partially-open session; the
+                # original error below is what matters to the user.
+                pass
             messagebox.showerror("Ошибка подключения к Deepgram", str(exc))
             self._session = None
             return
@@ -138,14 +159,30 @@ class App(tk.Tk):
             return
         session = self._session
         self._session = None
-        session.stop()
+        try:
+            try:
+                session.stop()
+            except Exception as exc:
+                messagebox.showwarning("Предупреждение", f"Ошибка при остановке сессии: {exc}")
+            export_session(session.store, self._output_dir)
+            messagebox.showinfo("Готово", f"Транскрипт сохранён в:\n{self._output_dir.resolve()}")
+        except Exception as exc:
+            messagebox.showerror("Ошибка экспорта", str(exc))
+        finally:
+            self.start_button.config(state="normal")
+            self.stop_button.config(state="disabled")
+            self.mute_button.config(state="disabled")
 
-        export_session(session.store, self._output_dir)
-
-        self.start_button.config(state="normal")
-        self.stop_button.config(state="disabled")
-        self.mute_button.config(state="disabled")
-        messagebox.showinfo("Готово", f"Транскрипт сохранён в:\n{self._output_dir.resolve()}")
+    def _on_close(self) -> None:
+        if self._session is not None:
+            if not messagebox.askyesno(
+                "Завершить сеанс?",
+                "Идёт запись. Закрыть окно сейчас и сохранить то, что уже записано?",
+            ):
+                return
+            self._on_stop()
+        self._pa.terminate()
+        self.destroy()
 
     def _on_mute_toggle(self) -> None:
         self._muted = not self._muted
@@ -169,6 +206,9 @@ class App(tk.Tk):
             self._add_speaker_row(event.speaker_key, event.speaker_name)
         elif event.kind == "utterance":
             self._update_transcript(event)
+        elif event.kind == "error":
+            messagebox.showerror("Ошибка соединения", f"Сессия остановлена из-за ошибки:\n{event.text}")
+            self._on_stop()
 
     def _add_speaker_row(self, speaker_key, default_name: str) -> None:
         if speaker_key in self._speaker_rows:

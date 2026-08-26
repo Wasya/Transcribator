@@ -1,5 +1,6 @@
 import queue
 import threading
+import time
 import wave
 from dataclasses import dataclass
 from datetime import timedelta
@@ -96,9 +97,30 @@ class TranscriptionSession:
                 chunk = chunk_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            stream.send(chunk)
-            if wav_writer is not None:
-                wav_writer.writeframes(chunk)
+            try:
+                stream.send(chunk)
+                if wav_writer is not None:
+                    wav_writer.writeframes(chunk)
+            except Exception as exc:
+                self.events.put(
+                    UIEvent(kind="error", speaker_key=("error", None), speaker_name="", text=str(exc))
+                )
+                break
+
+    @staticmethod
+    def _drain_queue(chunk_queue: "queue.Queue[bytes]", stream: DeepgramStream) -> None:
+        """Non-blocking drain of whatever's left in chunk_queue, sending each
+        chunk before the connection is torn down, so trailing audio isn't
+        silently dropped on stop()."""
+        while True:
+            try:
+                chunk = chunk_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                stream.send(chunk)
+            except Exception:
+                return
 
     def start(self) -> None:
         self.store.register_mic()
@@ -148,6 +170,13 @@ class TranscriptionSession:
         self.store.rename(speaker_key, new_name)
 
     def stop(self) -> None:
+        # Drain whatever's still sitting in the queues and send it before the
+        # sender loops are told to stop, so trailing audio isn't discarded.
+        if self._mic_stream is not None:
+            self._drain_queue(self._mic_queue, self._mic_stream)
+        if self._system_stream is not None:
+            self._drain_queue(self._system_queue, self._system_stream)
+
         self._stop_senders.set()
         for t in self._sender_threads:
             t.join(timeout=2)
@@ -155,6 +184,12 @@ class TranscriptionSession:
             self._mic_capture.stop()
         if self._system_capture is not None:
             self._system_capture.stop()
+
+        # Brief grace period so trailing is_final results the API is still
+        # computing have a chance to arrive before we close the connections.
+        if self._mic_stream is not None or self._system_stream is not None:
+            time.sleep(0.5)
+
         if self._mic_stream is not None:
             self._mic_stream.stop()
         if self._system_stream is not None:

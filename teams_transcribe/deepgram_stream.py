@@ -52,16 +52,21 @@ class DeepgramStream:
         self._started_at = datetime.now()
 
         def on_message(result):
-            if getattr(result, "type", None) != "Results":
-                return
-            alt = result.channel.alternatives[0]
-            text = alt.transcript
-            if not text:
-                return
-            speaker_id = None
-            if alt.words:
-                speaker_id = alt.words[0].speaker
-            self._on_result(result.start, result.duration, bool(result.is_final), speaker_id, text)
+            # Defensive: an unexpected/malformed message or an exception raised
+            # inside _on_result must not kill the SDK's listener thread silently.
+            try:
+                if getattr(result, "type", None) != "Results":
+                    return
+                alt = result.channel.alternatives[0]
+                text = alt.transcript
+                if not text:
+                    return
+                speaker_id = None
+                if alt.words:
+                    speaker_id = alt.words[0].speaker
+                self._on_result(result.start, result.duration, bool(result.is_final), speaker_id, text)
+            except Exception:
+                pass
 
         self._connection.on(EventType.MESSAGE, on_message)
 
