@@ -102,16 +102,26 @@ class TranscriptionSession:
                 if wav_writer is not None:
                     wav_writer.writeframes(chunk)
             except Exception as exc:
-                self.events.put(
-                    UIEvent(kind="error", speaker_key=("error", None), speaker_name="", text=str(exc))
-                )
+                self._on_stream_error(exc)
                 break
 
+    def _on_stream_error(self, exc: Exception) -> None:
+        self.events.put(
+            UIEvent(kind="error", speaker_key=("error", None), speaker_name="", text=str(exc))
+        )
+
     @staticmethod
-    def _drain_queue(chunk_queue: "queue.Queue[bytes]", stream: DeepgramStream) -> None:
+    def _drain_queue(
+        chunk_queue: "queue.Queue[bytes]",
+        stream: DeepgramStream,
+        wav_writer: Optional[wave.Wave_write],
+    ) -> None:
         """Non-blocking drain of whatever's left in chunk_queue, sending each
-        chunk before the connection is torn down, so trailing audio isn't
-        silently dropped on stop()."""
+        chunk (and writing it to wav_writer, if open) before the connection is
+        torn down, so trailing audio isn't silently dropped on stop(). Must
+        only be called after the corresponding sender thread has been joined,
+        so nothing else is concurrently pulling from chunk_queue or calling
+        the unsynchronized stream.send()."""
         while True:
             try:
                 chunk = chunk_queue.get_nowait()
@@ -119,6 +129,8 @@ class TranscriptionSession:
                 return
             try:
                 stream.send(chunk)
+                if wav_writer is not None:
+                    wav_writer.writeframes(chunk)
             except Exception:
                 return
 
@@ -136,6 +148,7 @@ class TranscriptionSession:
             self._client, model="nova-3", language=self._language,
             sample_rate=self._mic_device.sample_rate, diarize=False,
             endpointing=endpointing, on_result=self._mic_result,
+            on_error=self._on_stream_error,
         )
         self._mic_stream.start()
 
@@ -143,6 +156,7 @@ class TranscriptionSession:
             self._client, model="nova-3", language=self._language,
             sample_rate=self._system_device.sample_rate, diarize=True,
             endpointing=endpointing, on_result=self._system_result,
+            on_error=self._on_stream_error,
         )
         self._system_stream.start()
 
@@ -170,20 +184,30 @@ class TranscriptionSession:
         self.store.rename(speaker_key, new_name)
 
     def stop(self) -> None:
-        # Drain whatever's still sitting in the queues and send it before the
-        # sender loops are told to stop, so trailing audio isn't discarded.
-        if self._mic_stream is not None:
-            self._drain_queue(self._mic_queue, self._mic_stream)
-        if self._system_stream is not None:
-            self._drain_queue(self._system_queue, self._system_stream)
-
-        self._stop_senders.set()
-        for t in self._sender_threads:
-            t.join(timeout=2)
+        # Stop audio capture first so no new chunks get enqueued while we
+        # tear down the senders.
         if self._mic_capture is not None:
             self._mic_capture.stop()
         if self._system_capture is not None:
             self._system_capture.stop()
+
+        # Signal the sender loops to stop and wait for them to actually
+        # finish pulling from the queues before we touch those queues
+        # ourselves - otherwise the drain below and a still-live sender
+        # thread could concurrently pull from the same queue.Queue and both
+        # call the unsynchronized DeepgramStream.send() on the same socket.
+        self._stop_senders.set()
+        for t in self._sender_threads:
+            t.join(timeout=2)
+
+        # Now that the sender threads are guaranteed done, drain whatever's
+        # left in the queues (little to nothing after the join, but anything
+        # queued between a sender's last get() and the capture stop still
+        # needs to go out) so trailing audio isn't silently discarded.
+        if self._mic_stream is not None:
+            self._drain_queue(self._mic_queue, self._mic_stream, self._mic_wav)
+        if self._system_stream is not None:
+            self._drain_queue(self._system_queue, self._system_stream, self._system_wav)
 
         # Brief grace period so trailing is_final results the API is still
         # computing have a chance to arrive before we close the connections.

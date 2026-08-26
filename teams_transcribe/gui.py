@@ -197,6 +197,11 @@ class App(tk.Tk):
             while True:
                 event = self._session.events.get_nowait()
                 self._handle_event(event)
+                if self._session is None:
+                    # _handle_event triggered an auto-stop (e.g. an error
+                    # event), tearing down the session - don't keep pulling
+                    # from what may now be a stale/torn-down session's queue.
+                    break
         except queue.Empty:
             pass
         self.after(100, self._poll_events)

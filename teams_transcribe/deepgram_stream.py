@@ -19,6 +19,7 @@ class DeepgramStream:
         diarize: bool,
         endpointing: int,
         on_result: Callable[[float, float, bool, Optional[int], str], None],
+        on_error: Optional[Callable[[Exception], None]] = None,
     ):
         self._client = client
         self._model = model
@@ -27,6 +28,7 @@ class DeepgramStream:
         self._diarize = diarize
         self._endpointing = endpointing
         self._on_result = on_result
+        self._on_error = on_error
         self._connection_ctx = None
         self._connection = None
         self._started_at: Optional[datetime] = None
@@ -65,8 +67,9 @@ class DeepgramStream:
                 if alt.words:
                     speaker_id = alt.words[0].speaker
                 self._on_result(result.start, result.duration, bool(result.is_final), speaker_id, text)
-            except Exception:
-                pass
+            except Exception as exc:
+                if self._on_error is not None:
+                    self._on_error(exc)
 
         self._connection.on(EventType.MESSAGE, on_message)
 
