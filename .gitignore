@@ -1,0 +1,8 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+
+# Session output (ListenSteam.py / TeamsTranscribe.py transcripts, generated at runtime)
+DeepGram[0-9][0-9]-*.txt
+DeepGramMeeting[0-9][0-9]-*/
