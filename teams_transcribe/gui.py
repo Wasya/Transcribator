@@ -10,7 +10,12 @@ from teams_transcribe.audio_capture import list_input_devices, list_loopback_dev
 from teams_transcribe.exporter import export_session
 from teams_transcribe.session import TranscriptionSession
 
-LANGUAGES = [("Русский", "ru"), ("Английский", "en"), ("Мультиязычный (code-switching)", "multi")]
+LANGUAGES = [
+    ("Русский", "ru"),
+    ("Английский", "en"),
+    ("Немецкий", "de"),
+    ("Мультиязычный (code-switching)", "multi"),
+]
 
 CONSENT_NOTICE = (
     "Это приложение записывает и расшифровывает весь разговор, включая\n"
