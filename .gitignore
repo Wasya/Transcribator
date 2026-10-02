@@ -6,7 +6,10 @@ __pycache__/
 # Claude Code's own local session/worktree state — not part of the project
 .claude/
 
-# Session output (ListenSteam.py / TeamsTranscribe.py transcripts, generated at runtime).
+# Session output of TeamsTranscribe.py: Output/<session folders>
+Output/
+
+# Legacy locations (older versions wrote into the project root; ListenSteam.py / TeamsTranscribe.py transcripts, generated at runtime).
 # Any session folder ends in the DD-MM-YYYY_HH-MM timestamp suffix, regardless
 # of prefix (default "DeepGramMeeting" or a custom "Имя сессии" from the GUI),
 # and rapid restarts may add a _2/_3/... disambiguator, so match that too.

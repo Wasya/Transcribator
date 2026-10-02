@@ -24,6 +24,9 @@ from teams_transcribe.session import (
 
 log = logging.getLogger("teams_transcribe")
 
+# Session folders live in <project root>/Output regardless of the working directory.
+OUTPUT_ROOT = Path(__file__).resolve().parent.parent / "Output"
+
 BACKENDS = [
     ("Deepgram (облако, нужен API-ключ)", BACKEND_DEEPGRAM),
     ("WhisperX (локально, бесплатно)", BACKEND_WHISPERX),
@@ -168,12 +171,12 @@ class App(tk.Tk):
         """Return a Path for base_name, disambiguated with a _2, _3, ... suffix
         if a non-empty directory of that name already exists (minute-granularity
         timestamps in build_timestamped_name can collide on rapid restart)."""
-        candidate = Path(base_name)
+        candidate = OUTPUT_ROOT / base_name
         if not candidate.exists() or not any(candidate.iterdir()):
             return candidate
         n = 2
         while True:
-            candidate = Path(f"{base_name}_{n}")
+            candidate = OUTPUT_ROOT / f"{base_name}_{n}"
             if not candidate.exists() or not any(candidate.iterdir()):
                 return candidate
             n += 1
@@ -244,7 +247,7 @@ class App(tk.Tk):
 
         session_name = build_timestamped_name(self.session_name_var.get(), "DeepGramMeeting")
         self._output_dir = self._resolve_output_dir(session_name)
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._output_dir.mkdir(parents=True, exist_ok=True)  # also creates Output/
         options = self._build_options()
         if options is None:
             return
