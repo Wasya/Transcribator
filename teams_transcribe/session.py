@@ -5,14 +5,20 @@ import wave
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pyaudiowpatch as pyaudio
-from deepgram import DeepgramClient
-
 from teams_transcribe.audio_capture import DeviceInfo, MicCapture, SystemCapture
-from teams_transcribe.deepgram_stream import DeepgramStream
 from teams_transcribe.transcript_store import SpeakerKey, TranscriptStore
+
+# Diarization modes for the WhisperX backend.
+DIARIZE_OFF = "off"
+DIARIZE_POST = "post"  # variant A: pyannote over system.wav after Stop
+DIARIZE_LIVE = "live"  # variant B: online voice clustering while recording
+DIARIZE_BOTH = "both"  # B during the call, then A to refine the final transcript
+
+BACKEND_DEEPGRAM = "deepgram"
+BACKEND_WHISPERX = "whisperx"
 
 
 def _open_wav_writer(path: Path, sample_rate: int) -> wave.Wave_write:
@@ -25,6 +31,21 @@ def _open_wav_writer(path: Path, sample_rate: int) -> wave.Wave_write:
 
 def _endpointing_for_language(language: str) -> int:
     return 100 if language == "multi" else 10
+
+
+@dataclass
+class SessionOptions:
+    backend: str = BACKEND_DEEPGRAM
+    language: str = "ru"
+    record_audio: bool = False
+    output_dir: Optional[Path] = None
+    deepgram_api_key: Optional[str] = None
+    # WhisperX backend only:
+    hf_token: Optional[str] = None
+    whisper_model: str = "small"
+    whisper_device: str = "cpu"
+    whisper_compute_type: str = "int8"
+    diarization: str = DIARIZE_POST
 
 
 @dataclass
@@ -42,28 +63,33 @@ class TranscriptionSession:
 
     def __init__(
         self,
-        api_key: str,
         mic_device: DeviceInfo,
         system_device: DeviceInfo,
-        language: str,
-        record_audio: bool = False,
-        output_dir: Optional[Path] = None,
+        options: SessionOptions,
     ):
         self.store = TranscriptStore()
         self.events: "queue.Queue[UIEvent]" = queue.Queue()
-        self._client = DeepgramClient(api_key=api_key)
+        self.options = options
         self._mic_device = mic_device
         self._system_device = system_device
-        self._language = language
-        self._record_audio = record_audio
-        self._output_dir = output_dir
+        self._language = options.language
+        self._output_dir = options.output_dir
+        whisper = options.backend == BACKEND_WHISPERX
+        # Variant A needs the system audio on disk; the WAV is deleted after
+        # post-processing unless the user asked to keep raw audio.
+        self.needs_diarization_pass = whisper and options.diarization in (DIARIZE_POST, DIARIZE_BOTH)
+        self._record_audio = options.record_audio
+        self._record_system_wav = options.record_audio or self.needs_diarization_pass
+        self._client = None
+        self._engine = None
+        self._identifier = None
         self._mic_queue: "queue.Queue[bytes]" = queue.Queue()
         self._system_queue: "queue.Queue[bytes]" = queue.Queue()
         self._pa: Optional[pyaudio.PyAudio] = None
         self._mic_capture: Optional[MicCapture] = None
         self._system_capture: Optional[SystemCapture] = None
-        self._mic_stream: Optional[DeepgramStream] = None
-        self._system_stream: Optional[DeepgramStream] = None
+        self._mic_stream: Optional[Any] = None
+        self._system_stream: Optional[Any] = None
         self._mic_wav: Optional[wave.Wave_write] = None
         self._system_wav: Optional[wave.Wave_write] = None
         self._sender_threads: list[threading.Thread] = []
@@ -73,7 +99,7 @@ class TranscriptionSession:
         key: SpeakerKey = ("mic", None)
         name = self.store.speaker_name(key)
         ts = self._mic_stream.started_at + timedelta(seconds=start)
-        self.store.add_utterance(key, ts, is_final, text)
+        self.store.add_utterance(key, ts, is_final, text, start, duration)
         self.events.put(UIEvent(kind="utterance", speaker_key=key, speaker_name=name, text=text, is_final=is_final))
 
     def _system_result(self, start, duration, is_final, speaker_id, text):
@@ -83,13 +109,13 @@ class TranscriptionSession:
         if is_new:
             self.events.put(UIEvent(kind="new_speaker", speaker_key=key, speaker_name=name))
         ts = self._system_stream.started_at + timedelta(seconds=start)
-        self.store.add_utterance(key, ts, is_final, text)
+        self.store.add_utterance(key, ts, is_final, text, start, duration)
         self.events.put(UIEvent(kind="utterance", speaker_key=key, speaker_name=name, text=text, is_final=is_final))
 
     def _sender_loop(
         self,
         chunk_queue: "queue.Queue[bytes]",
-        stream: DeepgramStream,
+        stream: Any,
         wav_writer: Optional[wave.Wave_write],
     ) -> None:
         while not self._stop_senders.is_set():
@@ -113,7 +139,7 @@ class TranscriptionSession:
     @staticmethod
     def _drain_queue(
         chunk_queue: "queue.Queue[bytes]",
-        stream: DeepgramStream,
+        stream: Any,
         wav_writer: Optional[wave.Wave_write],
     ) -> None:
         """Non-blocking drain of whatever's left in chunk_queue, sending each
@@ -134,29 +160,63 @@ class TranscriptionSession:
             except Exception:
                 return
 
+    def prepare(self) -> None:
+        """Heavy, GUI-independent setup (model loading / client creation). Safe to
+        call from a worker thread; must complete before start()."""
+        opts = self.options
+        if opts.backend == BACKEND_DEEPGRAM:
+            from deepgram import DeepgramClient
+
+            self._client = DeepgramClient(api_key=opts.deepgram_api_key)
+            return
+        from teams_transcribe.whisper_stream import WhisperEngine
+
+        self._engine = WhisperEngine(opts.whisper_model, opts.whisper_device, opts.whisper_compute_type)
+        self._engine.load()
+        if opts.diarization in (DIARIZE_LIVE, DIARIZE_BOTH):
+            from teams_transcribe.speaker_id import OnlineSpeakerIdentifier, PyannoteEmbedder
+
+            embedder = PyannoteEmbedder(opts.hf_token, opts.whisper_device)
+            embedder.load()
+            self._identifier = OnlineSpeakerIdentifier(embedder)
+
+    def _make_stream(self, device: DeviceInfo, *, diarize: bool, endpointing: int, on_result):
+        if self.options.backend == BACKEND_DEEPGRAM:
+            from teams_transcribe.deepgram_stream import DeepgramStream
+
+            return DeepgramStream(
+                self._client, model="nova-3", language=self._language,
+                sample_rate=device.sample_rate, diarize=diarize,
+                endpointing=endpointing, on_result=on_result,
+                on_error=self._on_stream_error,
+            )
+        from teams_transcribe.whisper_stream import WhisperStream
+
+        return WhisperStream(
+            self._engine, language=self._language, sample_rate=device.sample_rate,
+            on_result=on_result, on_error=self._on_stream_error,
+            speaker_identifier=self._identifier if diarize else None,
+        )
+
     def start(self) -> None:
         self.store.register_mic()
         self._pa = pyaudio.PyAudio()
         endpointing = _endpointing_for_language(self._language)
 
+        if self._record_audio or self._record_system_wav:
+            assert self._output_dir is not None, "output_dir is required when recording audio"
         if self._record_audio:
-            assert self._output_dir is not None, "output_dir is required when record_audio=True"
             self._mic_wav = _open_wav_writer(self._output_dir / "mic.wav", self._mic_device.sample_rate)
+        if self._record_system_wav:
             self._system_wav = _open_wav_writer(self._output_dir / "system.wav", self._system_device.sample_rate)
 
-        self._mic_stream = DeepgramStream(
-            self._client, model="nova-3", language=self._language,
-            sample_rate=self._mic_device.sample_rate, diarize=False,
-            endpointing=endpointing, on_result=self._mic_result,
-            on_error=self._on_stream_error,
+        self._mic_stream = self._make_stream(
+            self._mic_device, diarize=False, endpointing=endpointing, on_result=self._mic_result
         )
         self._mic_stream.start()
 
-        self._system_stream = DeepgramStream(
-            self._client, model="nova-3", language=self._language,
-            sample_rate=self._system_device.sample_rate, diarize=True,
-            endpointing=endpointing, on_result=self._system_result,
-            on_error=self._on_stream_error,
+        self._system_stream = self._make_stream(
+            self._system_device, diarize=True, endpointing=endpointing, on_result=self._system_result
         )
         self._system_stream.start()
 
@@ -195,7 +255,7 @@ class TranscriptionSession:
         # finish pulling from the queues before we touch those queues
         # ourselves - otherwise the drain below and a still-live sender
         # thread could concurrently pull from the same queue.Queue and both
-        # call the unsynchronized DeepgramStream.send() on the same socket.
+        # call the unsynchronized stream.send() on the same socket.
         self._stop_senders.set()
         for t in self._sender_threads:
             t.join(timeout=2)
@@ -211,7 +271,9 @@ class TranscriptionSession:
 
         # Brief grace period so trailing is_final results the API is still
         # computing have a chance to arrive before we close the connections.
-        if self._mic_stream is not None or self._system_stream is not None:
+        if self.options.backend == BACKEND_DEEPGRAM and (
+            self._mic_stream is not None or self._system_stream is not None
+        ):
             time.sleep(0.5)
 
         if self._mic_stream is not None:

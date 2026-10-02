@@ -1,4 +1,6 @@
+import logging
 import queue
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
@@ -8,7 +10,39 @@ import pyaudiowpatch as pyaudio
 from naming import build_timestamped_name
 from teams_transcribe.audio_capture import list_input_devices, list_loopback_devices
 from teams_transcribe.exporter import export_session
-from teams_transcribe.session import TranscriptionSession
+from teams_transcribe.config import Settings, resolve_whisper_runtime
+from teams_transcribe.session import (
+    BACKEND_DEEPGRAM,
+    BACKEND_WHISPERX,
+    DIARIZE_BOTH,
+    DIARIZE_LIVE,
+    DIARIZE_OFF,
+    DIARIZE_POST,
+    SessionOptions,
+    TranscriptionSession,
+)
+
+log = logging.getLogger("teams_transcribe")
+
+BACKENDS = [
+    ("Deepgram (облако, нужен API-ключ)", BACKEND_DEEPGRAM),
+    ("WhisperX (локально, бесплатно)", BACKEND_WHISPERX),
+]
+
+WHISPER_MODELS = [
+    ("Авто (по устройству)", None),
+    ("small — быстрая, для CPU", "small"),
+    ("medium", "medium"),
+    ("large-v3-turbo — для GPU", "large-v3-turbo"),
+    ("large-v3 — максимум качества", "large-v3"),
+]
+
+DIARIZATION_MODES = [
+    ("После «Стоп» (вариант A, точнее)", DIARIZE_POST),
+    ("Во время звонка (вариант B)", DIARIZE_LIVE),
+    ("B во время звонка + A после «Стоп»", DIARIZE_BOTH),
+    ("Не разделять участников", DIARIZE_OFF),
+]
 
 LANGUAGES = [
     ("Русский", "ru"),
@@ -25,10 +59,12 @@ CONSENT_NOTICE = (
 
 
 class App(tk.Tk):
-    def __init__(self, api_key: str):
+    def __init__(self, settings: Settings):
         super().__init__()
         self.title("TeamsTranscribe")
-        self._api_key = api_key
+        self._settings = settings
+        self._work_queue: "queue.Queue" = queue.Queue()
+        self._busy = False
         self._session: TranscriptionSession | None = None
         self._muted = False
         self._speaker_rows: dict[tuple, tk.Entry] = {}
@@ -71,14 +107,37 @@ class App(tk.Tk):
         self.lang_combo.current(0)
         self.lang_combo.grid(row=2, column=1, sticky="w", padx=4)
 
-        ttk.Label(top, text="Имя сессии (опц.):").grid(row=3, column=0, sticky="w")
+        ttk.Label(top, text="Движок распознавания:").grid(row=3, column=0, sticky="w")
+        self.backend_combo = ttk.Combobox(
+            top, values=[label for label, _ in BACKENDS], state="readonly", width=40
+        )
+        self.backend_combo.current(0 if self._settings.deepgram_api_key else 1)
+        self.backend_combo.grid(row=3, column=1, sticky="w", padx=4)
+        self.backend_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_backend_widgets())
+
+        ttk.Label(top, text="Модель WhisperX:").grid(row=4, column=0, sticky="w")
+        self.model_combo = ttk.Combobox(
+            top, values=[label for label, _ in WHISPER_MODELS], state="readonly", width=40
+        )
+        self.model_combo.current(0)
+        self.model_combo.grid(row=4, column=1, sticky="w", padx=4)
+
+        ttk.Label(top, text="Разбор по голосам:").grid(row=5, column=0, sticky="w")
+        self.diar_combo = ttk.Combobox(
+            top, values=[label for label, _ in DIARIZATION_MODES], state="readonly", width=40
+        )
+        self.diar_combo.current(0)
+        self.diar_combo.grid(row=5, column=1, sticky="w", padx=4)
+
+        ttk.Label(top, text="Имя сессии (опц.):").grid(row=6, column=0, sticky="w")
         self.session_name_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.session_name_var, width=42).grid(row=3, column=1, sticky="w", padx=4)
+        ttk.Entry(top, textvariable=self.session_name_var, width=42).grid(row=6, column=1, sticky="w", padx=4)
 
         self.record_wav_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             top, text="Сохранять сырое аудио (WAV)", variable=self.record_wav_var
-        ).grid(row=4, column=0, columnspan=2, sticky="w")
+        ).grid(row=7, column=0, columnspan=2, sticky="w")
+        self._update_backend_widgets()
 
         buttons = ttk.Frame(self)
         buttons.pack(fill="x", padx=8, pady=4)
@@ -88,6 +147,9 @@ class App(tk.Tk):
         self.stop_button.pack(side="left", padx=4)
         self.mute_button = ttk.Button(buttons, text="Заглушить микрофон", command=self._on_mute_toggle, state="disabled")
         self.mute_button.pack(side="left", padx=4)
+
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.status_var, foreground="#555").pack(fill="x", padx=8)
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=8, pady=4)
@@ -116,10 +178,79 @@ class App(tk.Tk):
                 return candidate
             n += 1
 
+    def _update_backend_widgets(self) -> None:
+        whisper = BACKENDS[self.backend_combo.current()][1] == BACKEND_WHISPERX
+        state = "readonly" if whisper else "disabled"
+        self.model_combo.config(state=state)
+        self.diar_combo.config(state=state)
+
+    def _set_status(self, text: str) -> None:
+        self.status_var.set(text)
+        self.update_idletasks()
+
+    def _setup_logging(self) -> None:
+        for h in list(log.handlers):
+            log.removeHandler(h)
+            h.close()
+        log.setLevel(logging.INFO)
+        handler = logging.FileHandler(self._output_dir / "session.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(handler)
+
+    def _build_options(self) -> SessionOptions | None:
+        backend = BACKENDS[self.backend_combo.current()][1]
+        language = LANGUAGES[self.lang_combo.current()][1]
+        opts = SessionOptions(
+            backend=backend, language=language, record_audio=self.record_wav_var.get(),
+            output_dir=self._output_dir, deepgram_api_key=self._settings.deepgram_api_key,
+            hf_token=self._settings.hf_token,
+        )
+        if backend == BACKEND_DEEPGRAM:
+            if not opts.deepgram_api_key:
+                messagebox.showerror(
+                    "Нет API-ключа",
+                    "DEEPGRAM_API_KEY не задан в .env.\nВыберите WhisperX или добавьте ключ.",
+                )
+                return None
+            return opts
+        try:
+            import faster_whisper  # noqa: F401
+        except ImportError:
+            messagebox.showerror(
+                "WhisperX не установлен",
+                "Установите зависимости локального движка:\n"
+                "  pip install -r requirements-whisperx.txt\n(см. README)",
+            )
+            return None
+        opts.diarization = DIARIZATION_MODES[self.diar_combo.current()][1]
+        if opts.diarization != DIARIZE_OFF and not opts.hf_token:
+            if not messagebox.askyesno(
+                "Нет HF_TOKEN",
+                "Для разбора по голосам нужен токен Hugging Face (HF_TOKEN в .env, см. README).\n"
+                "Продолжить без разбора по голосам?",
+            ):
+                return None
+            opts.diarization = DIARIZE_OFF
+        model_override = WHISPER_MODELS[self.model_combo.current()][1]
+        opts.whisper_model, opts.whisper_device, opts.whisper_compute_type = resolve_whisper_runtime(
+            self._settings, model_override
+        )
+        return opts
+
     def _on_start(self) -> None:
         if not self._mic_devices or not self._system_devices:
             messagebox.showerror("Ошибка", "Не найдено устройство микрофона или системного звука.")
             return
+
+        session_name = build_timestamped_name(self.session_name_var.get(), "DeepGramMeeting")
+        self._output_dir = self._resolve_output_dir(session_name)
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        options = self._build_options()
+        if options is None:
+            return
+        self._setup_logging()
+        safe = {k: v for k, v in vars(options).items() if k not in ("deepgram_api_key", "hf_token")}
+        log.info("start: %s", safe)
 
         for child in list(self.speakers_container.winfo_children()):
             child.destroy()
@@ -130,53 +261,140 @@ class App(tk.Tk):
 
         mic = self._mic_devices[self.mic_combo.current()]
         system = self._system_devices[self.system_combo.current()]
-        language = LANGUAGES[self.lang_combo.current()][1]
-        record_audio = self.record_wav_var.get()
+        self._session = TranscriptionSession(mic, system, options)
+        self.start_button.config(state="disabled")
+        self._busy = True
 
-        session_name = build_timestamped_name(self.session_name_var.get(), "DeepGramMeeting")
-        self._output_dir = self._resolve_output_dir(session_name)
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        if options.backend == BACKEND_WHISPERX:
+            self._set_status("Загрузка моделей (при первом запуске — скачивание, может занять минуты)…")
+        session = self._session
 
-        self._session = TranscriptionSession(
-            self._api_key, mic, system, language,
-            record_audio=record_audio, output_dir=self._output_dir,
-        )
-        try:
-            self._session.start()
-        except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+        def prepare():
             try:
-                self._session.stop()
+                session.prepare()
+                self._work_queue.put(("prepared", session, None))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("prepare failed")
+                self._work_queue.put(("prepared", session, exc))
+
+        threading.Thread(target=prepare, daemon=True).start()
+        self.after(150, self._poll_work)
+
+    def _finish_start(self, session: TranscriptionSession, error: Exception | None) -> None:
+        self._busy = False
+        if session is not self._session:
+            return
+        if error is None:
+            try:
+                session.start()
+            except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+                log.exception("start failed")
+                error = exc
+        if error is not None:
+            try:
+                session.stop()
             except Exception:
                 # Best-effort teardown of a partially-open session; the
                 # original error below is what matters to the user.
                 pass
-            messagebox.showerror("Ошибка подключения к Deepgram", str(exc))
+            if session.options.backend == BACKEND_DEEPGRAM:
+                title = "Ошибка подключения к Deepgram"
+            else:
+                title = "Ошибка запуска WhisperX"
+            messagebox.showerror(title, f"{error}\n\nПодробности: {self._output_dir / 'session.log'}")
             self._session = None
+            self._set_status("")
+            self.start_button.config(state="normal")
             return
-
-        self.start_button.config(state="disabled")
+        self._set_status("Идёт запись…")
         self.stop_button.config(state="normal")
         self.mute_button.config(state="normal")
         self.after(100, self._poll_events)
+
+    def _poll_work(self) -> None:
+        try:
+            while True:
+                kind, payload, extra = self._work_queue.get_nowait()
+                if kind == "prepared":
+                    self._finish_start(payload, extra)
+                elif kind == "status":
+                    self._set_status(payload)
+                elif kind == "diarized":
+                    self._busy = False
+                    self._finish_stop(payload, extra)
+        except queue.Empty:
+            pass
+        if self._busy:
+            self.after(150, self._poll_work)
 
     def _on_stop(self) -> None:
         if self._session is None:
             return
         session = self._session
         self._session = None
+        self.stop_button.config(state="disabled")
+        self.mute_button.config(state="disabled")
+        self._set_status("Остановка, доработка последних реплик…")
         try:
-            try:
-                session.stop()
-            except Exception as exc:
-                messagebox.showwarning("Предупреждение", f"Ошибка при остановке сессии: {exc}")
+            session.stop()
+        except Exception as exc:
+            log.exception("stop failed")
+            messagebox.showwarning("Предупреждение", f"Ошибка при остановке сессии: {exc}")
+
+        wav = self._output_dir / "system.wav"
+        if session.needs_diarization_pass and wav.exists():
+            from teams_transcribe.postprocess import diarize_system_wav
+
+            opts = session.options
+
+            def work():
+                err = None
+                try:
+                    n = diarize_system_wav(
+                        wav, session.store, opts.hf_token, opts.whisper_device,
+                        progress=lambda t: self._work_queue.put(("status", t, None)),
+                    )
+                    log.info("diarization pass: %s speakers", n)
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("diarization pass failed")
+                    err = exc
+                self._work_queue.put(("diarized", session, err))
+
+            self._set_status("Разбор по голосам…")
+            self._busy = True
+            threading.Thread(target=work, daemon=True).start()
+            self.after(150, self._poll_work)
+        else:
+            self._finish_stop(session, None)
+
+    def _finish_stop(self, session: TranscriptionSession, diar_error: Exception | None) -> None:
+        try:
+            if diar_error is not None:
+                messagebox.showwarning(
+                    "Разбор по голосам не удался",
+                    f"{diar_error}\n\nТранскрипт сохранён с разметкой, полученной во время звонка.",
+                )
+            elif session.needs_diarization_pass:
+                self._rebuild_speaker_rows(session)
+            if session.needs_diarization_pass and not session.options.record_audio:
+                (self._output_dir / "system.wav").unlink(missing_ok=True)
             export_session(session.store, self._output_dir)
             messagebox.showinfo("Готово", f"Транскрипт сохранён в:\n{self._output_dir.resolve()}")
         except Exception as exc:
+            log.exception("export failed")
             messagebox.showerror("Ошибка экспорта", str(exc))
         finally:
+            self._set_status("")
             self.start_button.config(state="normal")
             self.stop_button.config(state="disabled")
             self.mute_button.config(state="disabled")
+
+    def _rebuild_speaker_rows(self, session: TranscriptionSession) -> None:
+        for child in list(self.speakers_container.winfo_children()):
+            child.destroy()
+        self._speaker_rows.clear()
+        for key, name in session.store.system_speakers():
+            ttk.Label(self.speakers_container, text=name).pack(anchor="w")
 
     def _on_close(self) -> None:
         if self._session is not None:
@@ -186,6 +404,12 @@ class App(tk.Tk):
             ):
                 return
             self._on_stop()
+        if self._busy:
+            messagebox.showinfo(
+                "Подождите",
+                "Идёт загрузка или разбор по голосам. Окно можно закрыть, когда появится сообщение «Готово».",
+            )
+            return
         self._pa.terminate()
         self.destroy()
 
@@ -265,6 +489,6 @@ class App(tk.Tk):
         self.transcript_box.config(state="disabled")
 
 
-def run(api_key: str) -> None:
-    app = App(api_key)
+def run(settings: Settings) -> None:
+    app = App(settings)
     app.mainloop()

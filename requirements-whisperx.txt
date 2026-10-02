@@ -1,0 +1,3 @@
+# Локальный движок WhisperX. Ставится ПОСЛЕ requirements.txt и ПОСЛЕ установки torch
+# (см. README, раздел «WhisperX»): для видеокарты NVIDIA torch нужно ставить из индекса CUDA.
+whisperx==3.8.6
