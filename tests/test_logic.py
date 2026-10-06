@@ -60,6 +60,71 @@ class SegmenterTests(unittest.TestCase):
         self.assertAlmostEqual(out[1].end, 6.0, delta=0.05)
 
 
+class QuietAudioTests(unittest.TestCase):
+    def test_quiet_speech_is_detected(self):
+        seg = Segmenter()
+        out = seg.feed(np.concatenate([silence(1.0), tone(2.0, amp=0.007), silence(1.5)])) + seg.flush()
+        self.assertEqual(len(out), 1)  # rms ~0.005: below the old fixed threshold of 0.006
+
+    def test_soft_continuous_speech_does_not_raise_the_threshold(self):
+        seg = Segmenter()
+        rng = np.random.default_rng(0)
+        speech = (rng.standard_normal(TARGET_RATE * 60) * 0.01).astype(np.float32)  # rms 0.01 for a minute
+        seg.feed(speech)
+        stats = seg.pop_stats()
+        self.assertGreater(stats["speech_pct"], 90)
+        self.assertLessEqual(stats["threshold"], 0.006)
+
+    def test_normalize_level_only_amplifies_quiet_audio(self):
+        from teams_transcribe.audio_utils import normalize_level
+
+        quiet = tone(1.0, amp=0.05)
+        self.assertAlmostEqual(float(np.max(np.abs(normalize_level(quiet)))), 0.5, places=2)
+        loud = tone(1.0, amp=0.8)
+        self.assertIs(normalize_level(loud), loud)
+        zeros = silence(1.0)
+        self.assertIs(normalize_level(zeros), zeros)
+
+
+class Mp3ExportTests(unittest.TestCase):
+    def _write_wav(self, path, seconds=2.0, rate=48000):
+        import wave
+
+        samples = (tone(seconds, amp=0.3, rate=rate) * 32767).astype(np.int16)
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(samples.tobytes())
+
+    def test_compress_session_audio_replaces_wavs_with_mp3(self):
+        import tempfile
+        from pathlib import Path
+
+        from teams_transcribe.audio_export import compress_session_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self._write_wav(d / "mic.wav")
+            self._write_wav(d / "system.wav", rate=44100)
+            self.assertEqual(compress_session_audio(d), [])
+            self.assertEqual(sorted(p.name for p in d.iterdir()), ["mic.mp3", "system.mp3"])
+            self.assertGreater((d / "system.mp3").stat().st_size, 1000)
+
+    def test_failure_keeps_the_wav(self):
+        import tempfile
+        from pathlib import Path
+
+        from teams_transcribe.audio_export import compress_session_audio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "mic.wav").write_bytes(b"not a wav file")
+            self.assertEqual(compress_session_audio(d), ["mic.wav"])
+            self.assertTrue((d / "mic.wav").exists())
+            self.assertFalse((d / "mic.mp3").exists())
+
+
 class ResamplerTests(unittest.TestCase):
     def test_48k_to_16k_length_and_chunk_continuity(self):
         x = tone(1.0, rate=48000)

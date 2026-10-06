@@ -204,6 +204,7 @@ class TranscriptionSession:
             self._engine, language=self._language, sample_rate=device.sample_rate,
             on_result=on_result, on_error=self._on_stream_error,
             speaker_identifier=self._identifier if diarize else None,
+            label="system" if diarize else "mic",
         )
 
     def start(self) -> None:

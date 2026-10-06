@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-from teams_transcribe.audio_utils import Resampler, Segmenter, pcm16_to_float32
+from teams_transcribe.audio_utils import Resampler, Segmenter, normalize_level, pcm16_to_float32
 from teams_transcribe.hallucinations import clean_hallucinations
 
 log = logging.getLogger("teams_transcribe")
@@ -69,6 +69,7 @@ class WhisperEngine:
 
     def transcribe(self, audio, language: str) -> str:
         lang = None if language == "multi" else language
+        audio = normalize_level(audio)
         with self._lock:
             segments, _info = self._model.transcribe(
                 audio,
@@ -76,7 +77,10 @@ class WhisperEngine:
                 # Beam search is ~2x slower; on a CPU that is the difference between
                 # keeping up with the call and falling ever further behind.
                 beam_size=5 if self.device == "cuda" else 1,
+                # Radio and calls have music/noise under the voice: with the default 0.5
+                # this detector drops quiet or masked speech from inside a segment.
                 vad_filter=True,
+                vad_parameters={"threshold": 0.35},
                 condition_on_previous_text=False,
             )
             # Whisper itself flags passages it thinks contain no speech (music, noise):
@@ -144,12 +148,15 @@ class WhisperStream:
         on_result: Callable[[float, float, bool, Optional[int], str], None],
         on_error: Optional[Callable[[Exception], None]] = None,
         speaker_identifier: Optional[Callable] = None,
+        label: str = "audio",
     ):
         self._engine = engine
         self._language = language
         self._on_result = on_result
         self._on_error = on_error
         self._identifier = speaker_identifier
+        self._label = label
+        self._last_stats_log = time.monotonic()
         self._resampler = Resampler(sample_rate)
         self._segmenter = Segmenter(max_segment=self.MAX_SEGMENT)
         self._jobs: "queue.Queue" = queue.Queue()
@@ -182,6 +189,16 @@ class WhisperStream:
         samples = self._resampler.process(pcm16_to_float32(pcm16_bytes))
         for segment in self._segmenter.feed(samples):
             self._enqueue(segment)
+        now = time.monotonic()
+        if now - self._last_stats_log >= 10.0:
+            self._last_stats_log = now
+            st = self._segmenter.pop_stats()
+            # Tells apart "nobody spoke / too quiet" from "speech was there but not recognized".
+            log.info(
+                "level %s: %.0fs heard, speech frames %.0f%%, rms mean %.4f max %.4f, threshold %.4f (floor %.4f)",
+                self._label, st["seconds"], st["speech_pct"], st["rms_mean"], st["rms_max"],
+                st["threshold"], st["noise_floor"],
+            )
 
     def stop(self) -> None:
         """Flush the pending utterance, wait for the worker to finish the backlog."""

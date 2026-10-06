@@ -1,9 +1,19 @@
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
 TARGET_RATE = 16000
+
+
+def normalize_level(audio: np.ndarray, target_peak: float = 0.5, max_gain: float = 20.0) -> np.ndarray:
+    """Amplify quiet audio (never attenuate) so the recognizer's own speech detector
+    and the model see a healthy level. Silence is left alone."""
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    if peak < 1e-4 or peak >= target_peak:
+        return audio
+    return audio * min(max_gain, target_peak / peak)
 
 
 def pcm16_to_float32(pcm16_bytes: bytes) -> np.ndarray:
@@ -76,8 +86,9 @@ class Segmenter:
         max_segment: float = 20.0,
         cut_search: float = 3.0,
         preroll: float = 0.3,
-        min_threshold: float = 0.006,
-        noise_factor: float = 3.0,
+        min_threshold: float = 0.003,
+        max_threshold: float = 0.006,
+        noise_factor: float = 2.5,
     ):
         self._min_silence_frames = max(1, int(min_silence * TARGET_RATE / self.FRAME))
         self._min_speech_frames = max(1, int(min_speech * TARGET_RATE / self.FRAME))
@@ -87,7 +98,20 @@ class Segmenter:
         self._preroll_frames = int(preroll * TARGET_RATE / self.FRAME)
         self._min_threshold = min_threshold
         self._noise_factor = noise_factor
+        self._max_threshold = max_threshold
+        # Noise floor = 10th percentile of the last ~5 s of frame loudness. (An average
+        # of "quiet" frames feeds back on itself: soft speech raises the floor, the
+        # threshold follows, and soon nothing counts as speech.) The threshold is also
+        # capped low, so a steady signal (compressed radio, a loud room) is still
+        # treated as speech rather than masked. The recognizer
+        # has its own speech detector for whatever extra non-speech gets through here.
+        self._history: "deque[float]" = deque(maxlen=170)
         self._noise_floor = 0.0
+        self._threshold = min_threshold
+        self._stat_frames = 0
+        self._stat_speech = 0
+        self._stat_rms_sum = 0.0
+        self._stat_rms_max = 0.0
         self._pending = np.zeros(0, dtype=np.float32)
         self._frame_index = 0  # index of the next frame to be consumed
         # Per-frame records (audio, rms, is_speech) of the pre-roll ring and the open segment.
@@ -100,11 +124,30 @@ class Segmenter:
 
     def _classify(self, frame: np.ndarray) -> "_Frame":
         rms = float(np.sqrt(np.mean(frame * frame)))
-        threshold = max(self._min_threshold, self._noise_factor * self._noise_floor)
-        speech = rms > threshold
-        if not speech:
-            self._noise_floor = rms if self._noise_floor == 0.0 else 0.95 * self._noise_floor + 0.05 * rms
+        self._history.append(rms)
+        self._noise_floor = float(np.percentile(self._history, 10))
+        self._threshold = min(self._max_threshold, max(self._min_threshold, self._noise_factor * self._noise_floor))
+        speech = rms > self._threshold
+        self._stat_frames += 1
+        self._stat_speech += speech
+        self._stat_rms_sum += rms
+        self._stat_rms_max = max(self._stat_rms_max, rms)
         return _Frame(frame, rms, speech)
+
+    def pop_stats(self) -> dict:
+        """Loudness/detection statistics since the previous call (for diagnostics)."""
+        n = max(1, self._stat_frames)
+        stats = {
+            "seconds": self._stat_frames * self.FRAME / TARGET_RATE,
+            "speech_pct": 100.0 * self._stat_speech / n,
+            "rms_mean": self._stat_rms_sum / n,
+            "rms_max": self._stat_rms_max,
+            "threshold": self._threshold,
+            "noise_floor": self._noise_floor,
+        }
+        self._stat_frames = self._stat_speech = 0
+        self._stat_rms_sum = self._stat_rms_max = 0.0
+        return stats
 
     def _make_segment(self, frames: list["_Frame"], start_frame: int) -> Segment:
         audio = np.concatenate([f.audio for f in frames])

@@ -15,7 +15,7 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8")
     print(f"Python {sys.version.split()[0]} / {platform.platform()}")
     for pkg in ("deepgram-sdk", "PyAudioWPatch", "python-dotenv", "whisperx", "faster-whisper",
-                "ctranslate2", "torch", "torchaudio", "pyannote.audio", "numpy"):
+                "lameenc", "ctranslate2", "torch", "torchaudio", "pyannote.audio", "numpy"):
         print(f"{pkg:16} {version(pkg)}")
     try:
         import torch

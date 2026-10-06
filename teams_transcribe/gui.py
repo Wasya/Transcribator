@@ -182,7 +182,7 @@ class App(tk.Tk):
 
         self.record_wav_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            top, text="Сохранять сырое аудио (WAV)", variable=self.record_wav_var
+            top, text="Сохранять аудио записи (MP3)", variable=self.record_wav_var
         ).grid(row=7, column=0, columnspan=2, sticky="w")
 
         self.drop_echo_var = tk.BooleanVar(value=True)
@@ -560,6 +560,15 @@ class App(tk.Tk):
                 except Exception as exc:  # noqa: BLE001
                     log.exception("diarization pass failed")
                     diar_error = exc
+            if opts.record_audio:
+                from teams_transcribe.audio_export import compress_session_audio
+
+                try:
+                    kept = compress_session_audio(self._output_dir, progress=status)
+                    if kept:
+                        log.warning("kept as WAV (MP3 conversion failed): %s", kept)
+                except Exception:  # noqa: BLE001 - e.g. lameenc missing: WAVs simply stay
+                    log.exception("audio compression skipped")
             self._work_queue.put(("stopped", session, (stop_error, diar_error)))
 
         self._start_background_work(work)
