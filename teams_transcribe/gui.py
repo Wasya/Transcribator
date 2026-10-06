@@ -83,6 +83,11 @@ class App(tk.Tk):
         self._settings = settings
         self._work_queue: "queue.Queue" = queue.Queue()
         self._busy = False
+        self._activity_text = ""
+        self._activity_began: float | None = None
+        self._tick_job = None
+        self._recording_began = 0.0
+        self._heard_speech = False  # a recognized utterance has appeared in this session
         self._session: TranscriptionSession | None = None
         self._muted = False
         self._speaker_rows: dict[tuple, tk.Entry] = {}
@@ -213,7 +218,11 @@ class App(tk.Tk):
         self.reexport_button.pack(side="left", padx=(16, 4))
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status_var, foreground="#555").pack(fill="x", padx=8)
+        status_row = ttk.Frame(self)
+        status_row.pack(fill="x", padx=8)
+        # Moving bar = "the program is working, not frozen" (model loading, stopping, diarization).
+        self.activity_bar = ttk.Progressbar(status_row, mode="indeterminate", length=140)
+        ttk.Label(status_row, textvariable=self.status_var, foreground="#555").pack(side="left", fill="x")
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=8, pady=4)
@@ -273,11 +282,18 @@ class App(tk.Tk):
         self.mic_level["value"] = mic
         self.system_level["value"] = system
         session = self._session
-        if session is not None and self._recording and session.options.backend == BACKEND_WHISPERX:
-            lag = session.backlog_seconds
-            text = "Идёт запись…"
-            if lag >= 3.0:
-                text += f"  Распознавание отстаёт на {lag:.0f} с — попробуйте модель полегче."
+        if session is not None and self._recording:
+            elapsed = int(time.monotonic() - self._recording_began)
+            count = len(session.store.final_utterances())
+            text = f"● Идёт запись {elapsed // 60}:{elapsed % 60:02d}  ·  реплик: {count}"
+            if not self._heard_speech:
+                text += "  ·  ждём речь (текст появляется после паузы в разговоре)…"
+            if session.options.backend == BACKEND_WHISPERX:
+                lag = session.backlog_seconds
+                if lag >= 3.0:
+                    text += f"  ·  распознавание отстаёт на {lag:.0f} с — попробуйте модель полегче"
+                elif lag > 0.5 and self._heard_speech:
+                    text += "  ·  распознаю…"
             if self.status_var.get() != text:
                 self.status_var.set(text)
         self.after(100, self._poll_levels)
@@ -304,8 +320,44 @@ class App(tk.Tk):
         self.diar_combo.config(state=state)
 
     def _set_status(self, text: str) -> None:
+        """Static status text; also ends any running activity indicator."""
+        self._end_activity()
         self.status_var.set(text)
         self.update_idletasks()
+
+    def _begin_activity(self, text: str) -> None:
+        """Long-running step: animated bar plus a live elapsed-seconds counter."""
+        self._activity_text = text
+        if self._activity_began is None:
+            self._activity_began = time.monotonic()
+            self.activity_bar.pack(side="right")
+            self.activity_bar.start(12)
+            self._tick_job = self.after(500, self._tick_activity)
+        self._tick_activity(reschedule=False)
+
+    def _set_activity_text(self, text: str) -> None:
+        if self._activity_began is None:
+            self._begin_activity(text)
+        else:
+            self._activity_text = text
+            self._tick_activity(reschedule=False)
+
+    def _end_activity(self) -> None:
+        if self._activity_began is not None:
+            self._activity_began = None
+            self.activity_bar.stop()
+            self.activity_bar.pack_forget()
+        if self._tick_job is not None:
+            self.after_cancel(self._tick_job)
+            self._tick_job = None
+
+    def _tick_activity(self, reschedule: bool = True) -> None:
+        if self._activity_began is None:
+            return
+        elapsed = int(time.monotonic() - self._activity_began)
+        self.status_var.set(f"{self._activity_text}  ({elapsed} с)")
+        if reschedule:
+            self._tick_job = self.after(500, self._tick_activity)
 
     def _setup_logging(self) -> None:
         for h in list(log.handlers):
@@ -387,14 +439,19 @@ class App(tk.Tk):
         self._render_view()
         self.start_button.config(state="disabled")
 
+        self._heard_speech = False
         if options.backend == BACKEND_WHISPERX:
-            self._set_status("Загрузка моделей (при первом запуске — скачивание, может занять минуты)…")
+            self._begin_activity(
+                "Загрузка моделей… (при первом запуске они скачиваются — несколько ГБ, ход виден в окне консоли)"
+            )
+        else:
+            self._begin_activity("Подключение…")
         session = self._session
 
         def prepare():
             try:
                 began = time.monotonic()
-                session.prepare()
+                session.prepare(progress=lambda t: self._work_queue.put(("status", t, None)))
                 log.info("models ready in %.1fs", time.monotonic() - began)
                 self._work_queue.put(("prepared", session, None))
             except Exception as exc:  # noqa: BLE001
@@ -442,6 +499,7 @@ class App(tk.Tk):
             self._start_monitor()
             return
         self._set_status("Идёт запись…")
+        self._recording_began = time.monotonic()
         self._recording = True
         self.stop_button.config(state="normal")
         self.mute_button.config(state="normal")
@@ -454,7 +512,7 @@ class App(tk.Tk):
                 if kind == "prepared":
                     self._finish_start(payload, extra)
                 elif kind == "status":
-                    self._set_status(payload)
+                    self._set_activity_text(payload)
                 elif kind == "stopped":
                     self._busy = False
                     stop_error, diar_error = extra
@@ -472,7 +530,7 @@ class App(tk.Tk):
         self._recording = False
         self.stop_button.config(state="disabled")
         self.mute_button.config(state="disabled")
-        self._set_status("Остановка, доработка последних реплик…")
+        self._begin_activity("Остановка, доработка последних реплик…")
 
         # session.stop() can block for a long time with WhisperX (it waits for
         # the recognizer to finish the backlog of segments), so it runs on a
@@ -666,6 +724,7 @@ class App(tk.Tk):
         if event.kind == "new_speaker":
             self._add_speaker_row(event.speaker_key, event.speaker_name, store)
         elif event.kind == "utterance":
+            self._heard_speech = True
             # The final text is already in the store; the view only tracks interims.
             if event.is_final:
                 self._interims.pop(event.speaker_key, None)

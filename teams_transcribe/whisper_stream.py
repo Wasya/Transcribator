@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from teams_transcribe.audio_utils import Resampler, Segmenter, pcm16_to_float32
+from teams_transcribe.hallucinations import clean_hallucinations
 
 log = logging.getLogger("teams_transcribe")
 
@@ -78,7 +79,10 @@ class WhisperEngine:
                 vad_filter=True,
                 condition_on_previous_text=False,
             )
-            return " ".join(s.text.strip() for s in segments).strip()
+            # Whisper itself flags passages it thinks contain no speech (music, noise):
+            # drop those it is also unsure about, then cut stock hallucinated phrases.
+            kept = [s.text.strip() for s in segments if not (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0)]
+            return clean_hallucinations(" ".join(kept))
 
 
 _engine_cache_lock = threading.Lock()

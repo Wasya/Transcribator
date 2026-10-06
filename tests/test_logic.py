@@ -262,6 +262,35 @@ class ModelCacheTests(unittest.TestCase):
         self.assertIsNot(a, c)
 
 
+class HallucinationFilterTests(unittest.TestCase):
+    def test_removes_credits_seen_in_real_session(self):
+        from teams_transcribe.hallucinations import clean_hallucinations as c
+
+        self.assertEqual(c("Субтитры подогнал «Симон»"), "")
+        self.assertEqual(c("Субтитры создавал DimaTorzok"), "")
+        self.assertEqual(c("Продолжение следует..."), "")
+        self.assertEqual(c("Редактор субтитров А.Семкин Корректор А.Егорова"), "")
+
+    def test_cuts_phrase_but_keeps_real_speech(self):
+        from teams_transcribe.hallucinations import clean_hallucinations as c
+
+        self.assertEqual(c("Дневной рубеж. Субтитры подогнал «Симон»"), "Дневной рубеж.")
+        self.assertEqual(c("Субтитры создавал DimaTorzok Помним, что вчера голосовали"), "Помним, что вчера голосовали")
+
+    def test_real_speech_is_untouched(self):
+        from teams_transcribe.hallucinations import clean_hallucinations as c
+
+        for text in ("Продолжение следует завтра, коллеги.", "Нужны ли нам субтитры в этом видео?", "Спасибо, всем пока"):
+            self.assertEqual(c(text), text)
+
+    def test_english_and_german_and_empty(self):
+        from teams_transcribe.hallucinations import clean_hallucinations as c
+
+        self.assertEqual(c("Thanks for watching!"), "")
+        self.assertEqual(c("Untertitel der Amara.org-Community"), "")
+        self.assertEqual(c("..."), "")
+
+
 class MergeUtterancesTests(unittest.TestCase):
     T0 = datetime(2026, 1, 1, 10, 0, 0)
 

@@ -5,7 +5,7 @@ import wave
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pyaudiowpatch as pyaudio
 from teams_transcribe.audio_capture import DeviceInfo, MicCapture, SystemCapture
@@ -164,23 +164,27 @@ class TranscriptionSession:
             except Exception:
                 return
 
-    def prepare(self) -> None:
+    def prepare(self, progress: Optional[Callable[[str], None]] = None) -> None:
         """Heavy, GUI-independent setup (model loading / client creation). Safe to
         call from a worker thread; must complete before start()."""
         opts = self.options
+        say = progress or (lambda _text: None)
         if opts.backend == BACKEND_DEEPGRAM:
             from deepgram import DeepgramClient
 
+            say("Подключение к Deepgram…")
             self._client = DeepgramClient(api_key=opts.deepgram_api_key)
             return
         from teams_transcribe.whisper_stream import get_engine
 
         # Models are cached across sessions (process-wide), so a second "Start"
         # with the same settings skips the slow load.
+        say(f"Загрузка модели распознавания речи ({opts.whisper_model}, {opts.whisper_device})…")
         self._engine = get_engine(opts.whisper_model, opts.whisper_device, opts.whisper_compute_type)
         if opts.diarization in (DIARIZE_LIVE, DIARIZE_BOTH):
             from teams_transcribe.speaker_id import OnlineSpeakerIdentifier, get_embedder
 
+            say("Загрузка модели распознавания голосов…")
             # The identifier itself (speaker centroids) is fresh for every session.
             self._identifier = OnlineSpeakerIdentifier(get_embedder(opts.hf_token, opts.whisper_device))
 
