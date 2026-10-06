@@ -214,6 +214,72 @@ class WhisperStreamStopTests(unittest.TestCase):
         self.assertLess(waited, 10)
 
 
+class FileModeTests(unittest.TestCase):
+    class FakeEngine:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, audio, language, prompt=None):
+            self.calls += 1
+            return f"фраза{self.calls}"
+
+    def _speech(self):
+        # two bursts of "speech" separated by a long pause -> two segments
+        return np.concatenate([silence(0.5), tone(2.0), silence(1.5), tone(2.0), silence(1.0)])
+
+    def test_pipeline_runs_on_in_memory_audio(self):
+        from teams_transcribe.file_mode import FileRunOptions, transcribe_audio
+
+        opts = FileRunOptions(model="x", device="cpu", compute_type="int8", diarization="off")
+        result = transcribe_audio(self._speech(), opts, engine=self.FakeEngine())
+        self.assertEqual(result.segments, 2)
+        self.assertEqual(result.words, 2)
+        self.assertEqual(result.text(), "фраза1 фраза2")
+        self.assertEqual(result.speakers, 1)
+        self.assertAlmostEqual(result.audio_seconds, 7.0, places=1)
+
+    def test_post_diarization_is_applied_with_injected_diarizer(self):
+        from teams_transcribe.file_mode import FileRunOptions, transcribe_audio
+
+        def diarizer(audio, token, device):
+            return [(0.0, 3.0, "A"), (3.0, 7.0, "B")]
+
+        opts = FileRunOptions(model="x", device="cpu", compute_type="int8", diarization="post")
+        result = transcribe_audio(self._speech(), opts, engine=self.FakeEngine(), diarizer=diarizer)
+        self.assertEqual(result.speakers, 2)
+
+    def test_post_diarization_without_token_is_skipped_with_a_note(self):
+        from teams_transcribe.file_mode import FileRunOptions, transcribe_audio
+
+        opts = FileRunOptions(model="x", device="cpu", compute_type="int8", diarization="post", hf_token=None)
+        result = transcribe_audio(self._speech(), opts, engine=self.FakeEngine())
+        self.assertEqual(result.speakers, 1)
+        self.assertTrue(any("HF_TOKEN" in n for n in result.notes))
+
+    def test_compare_texts_finds_missing_and_extra_phrases(self):
+        from teams_transcribe.file_mode import compare_texts
+
+        ref = "раз два три четыре пять шесть семь восемь девять десять"
+        hyp = "раз два три девять десять одиннадцать двенадцать тринадцать"
+        cmp = compare_texts(ref, hyp)
+        self.assertIn("четыре пять шесть семь восемь", cmp["missing"])
+        self.assertIn("одиннадцать двенадцать тринадцать", cmp["extra"])
+        self.assertAlmostEqual(compare_texts(ref, ref)["wer"], 0.0)
+        self.assertGreater(cmp["wer"], 0.2)
+
+    def test_reference_loader_strips_transcript_prefixes(self):
+        import tempfile
+        from pathlib import Path
+
+        from teams_transcribe.file_mode import load_reference_text
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "t.txt"
+            lines = ["[00:00:05] Собеседник 1: привет мир", "[00:00:09] Иван: как дела", "просто строка"]
+            p.write_text(chr(10).join(lines), encoding="utf-8")
+            self.assertEqual(load_reference_text(p), "привет мир как дела просто строка")
+
+
 class ResamplerTests(unittest.TestCase):
     def test_48k_to_16k_length_and_chunk_continuity(self):
         x = tone(1.0, rate=48000)

@@ -67,6 +67,8 @@ class WhisperEngine:
         self.compute_type = compute_type
         self._model = None
         self._lock = threading.Lock()
+        # Whisper's own speech detector (applied inside each segment). None = off.
+        self.vad_threshold: Optional[float] = 0.35
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -121,8 +123,8 @@ class WhisperEngine:
                 beam_size=5 if self.device == "cuda" else 1,
                 # Radio and calls have music/noise under the voice: with the default 0.5
                 # this detector drops quiet or masked speech from inside a segment.
-                vad_filter=True,
-                vad_parameters={"threshold": 0.35},
+                vad_filter=self.vad_threshold is not None,
+                vad_parameters={"threshold": self.vad_threshold} if self.vad_threshold is not None else None,
                 condition_on_previous_text=False,
                 initial_prompt=prompt,
             )
@@ -193,6 +195,7 @@ class WhisperStream:
         speaker_identifier: Optional[Callable] = None,
         label: str = "audio",
         use_context: bool = False,
+        max_segment: Optional[float] = None,
     ):
         self._engine = engine
         self._language = language
@@ -202,7 +205,7 @@ class WhisperStream:
         self._label = label
         self._last_stats_log = time.monotonic()
         self._resampler = Resampler(sample_rate)
-        self._segmenter = Segmenter(max_segment=self.MAX_SEGMENT)
+        self._segmenter = Segmenter(max_segment=max_segment or self.MAX_SEGMENT)
         self._jobs: "queue.Queue" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
         self._started_at: Optional[datetime] = None

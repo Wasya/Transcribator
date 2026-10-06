@@ -69,24 +69,21 @@ def run_diarization(audio_16k: np.ndarray, hf_token: Optional[str], device: str)
         release_gpu_memory()
 
 
-def diarize_system_wav(
-    wav_path: Path,
+def diarize_audio(
+    audio: np.ndarray,
     store: TranscriptStore,
     hf_token: Optional[str],
     device: str,
     progress: Optional[Callable[[str], None]] = None,
     diarizer: Callable[[np.ndarray, Optional[str], str], list[Turn]] = run_diarization,
 ) -> int:
-    """Variant A: label the system channel by speaker using the recorded system.wav.
+    """Variant A on an in-memory 16 kHz signal: relabel the store's system utterances.
 
     Returns the number of distinct speakers found (0 if nothing could be done).
     """
     utterances = store.system_utterances()
     if not utterances:
         return 0
-    if progress:
-        progress("Чтение записи системного звука…")
-    audio = read_wav_16k(wav_path)
     if progress:
         progress("Разбор по голосам (pyannote)…")
     turns = diarizer(audio, hf_token, device)
@@ -95,3 +92,20 @@ def diarize_system_wav(
         return 0
     store.apply_diarization(assignments)
     return len(set(assignments.values()))
+
+
+def diarize_system_wav(
+    wav_path: Path,
+    store: TranscriptStore,
+    hf_token: Optional[str],
+    device: str,
+    progress: Optional[Callable[[str], None]] = None,
+    diarizer: Callable[[np.ndarray, Optional[str], str], list[Turn]] = run_diarization,
+) -> int:
+    """Variant A: label the system channel by speaker using the recorded system.wav."""
+    if not store.system_utterances():
+        return 0
+    if progress:
+        progress("Чтение записи системного звука…")
+    audio = read_wav_16k(wav_path)
+    return diarize_audio(audio, store, hf_token, device, progress, diarizer)
