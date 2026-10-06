@@ -1,3 +1,4 @@
+import gc
 import queue
 import threading
 from datetime import datetime
@@ -37,7 +38,29 @@ class WhisperEngine:
                     pass
             from faster_whisper import WhisperModel
 
-            self._model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type)
+            kwargs = dict(device=self.device, compute_type=self.compute_type)
+            try:
+                # A model downloaded earlier loads straight from the local cache,
+                # skipping Hugging Face's online revision check (slow or hanging
+                # on a poor connection).
+                self._model = WhisperModel(self.model_name, local_files_only=True, **kwargs)
+            except Exception:  # noqa: BLE001 - not cached yet: download it
+                self._model = WhisperModel(self.model_name, **kwargs)
+            self._warm_up()
+
+    def _warm_up(self) -> None:
+        """Run one tiny decode so CUDA kernels/allocations are set up during
+        "Загрузка моделей", not on the first real phrase of the call."""
+        import numpy as np
+
+        try:
+            segments, _info = self._model.transcribe(
+                np.zeros(16000, dtype=np.float32), language="en", beam_size=1,
+                vad_filter=False, without_timestamps=True,
+            )
+            list(segments)
+        except Exception:  # noqa: BLE001 - warm-up is only an optimization
+            pass
 
     def transcribe(self, audio, language: str) -> str:
         lang = None if language == "multi" else language
@@ -45,7 +68,9 @@ class WhisperEngine:
             segments, _info = self._model.transcribe(
                 audio,
                 language=lang,
-                beam_size=5,
+                # Beam search is ~2x slower; on a CPU that is the difference between
+                # keeping up with the call and falling ever further behind.
+                beam_size=5 if self.device == "cuda" else 1,
                 vad_filter=True,
                 condition_on_previous_text=False,
             )
@@ -56,14 +81,32 @@ _engine_cache_lock = threading.Lock()
 _cached_engine: Optional[WhisperEngine] = None
 
 
+def release_gpu_memory() -> None:
+    """Collect unreachable models and hand torch's cached CUDA blocks back to the
+    driver, so the next model (ctranslate2 has its own allocator) can use them.
+    With 8 GB cards Windows otherwise silently spills into system RAM, which
+    makes recognition many times slower."""
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 def get_engine(model_name: str, device: str, compute_type: str) -> WhisperEngine:
     """Return a loaded WhisperEngine, reusing the one from the previous session
     when the (model, device, compute_type) triple is unchanged. Only one engine
-    is kept so switching models does not pile up copies in (GPU) memory."""
+    is kept, and the old one is freed before the new one loads, so switching
+    models does not pile up copies in (GPU) memory."""
     global _cached_engine
     with _engine_cache_lock:
         engine = _cached_engine
         if engine is None or engine.key != (model_name, device, compute_type):
+            _cached_engine = engine = None
+            release_gpu_memory()
             engine = WhisperEngine(model_name, device, compute_type)
             _cached_engine = engine
     engine.load()
@@ -75,7 +118,14 @@ class WhisperStream:
 
     Audio is cut into utterances at pauses; each finished utterance is transcribed
     on a worker thread and reported as a final result (no interim results).
+
+    Latency = waiting for the pause (or MAX_SEGMENT of non-stop speech) + the
+    recognition itself. MAX_SEGMENT is kept short so continuous speech still
+    shows up every few seconds; the GUI/export glue the pieces back into one
+    line per speaker (transcript_store.merge_utterances).
     """
+
+    MAX_SEGMENT = 8.0  # seconds
 
     def __init__(
         self,
@@ -93,14 +143,26 @@ class WhisperStream:
         self._on_error = on_error
         self._identifier = speaker_identifier
         self._resampler = Resampler(sample_rate)
-        self._segmenter = Segmenter()
+        self._segmenter = Segmenter(max_segment=self.MAX_SEGMENT)
         self._jobs: "queue.Queue" = queue.Queue()
         self._worker: Optional[threading.Thread] = None
         self._started_at: Optional[datetime] = None
+        self._backlog_lock = threading.Lock()
+        self._backlog = 0.0  # seconds of audio queued or being recognized
 
     @property
     def started_at(self) -> Optional[datetime]:
         return self._started_at
+
+    @property
+    def backlog_seconds(self) -> float:
+        with self._backlog_lock:
+            return self._backlog
+
+    def _enqueue(self, segment) -> None:
+        with self._backlog_lock:
+            self._backlog += segment.end - segment.start
+        self._jobs.put(segment)
 
     def start(self) -> None:
         self._started_at = datetime.now()
@@ -110,12 +172,12 @@ class WhisperStream:
     def send(self, pcm16_bytes: bytes) -> None:
         samples = self._resampler.process(pcm16_to_float32(pcm16_bytes))
         for segment in self._segmenter.feed(samples):
-            self._jobs.put(segment)
+            self._enqueue(segment)
 
     def stop(self) -> None:
         """Flush the pending utterance, wait for the worker to finish the backlog."""
         for segment in self._segmenter.flush():
-            self._jobs.put(segment)
+            self._enqueue(segment)
         self._jobs.put(None)
         if self._worker is not None:
             self._worker.join(timeout=300)
@@ -135,3 +197,6 @@ class WhisperStream:
             except Exception as exc:
                 if self._on_error is not None:
                     self._on_error(exc)
+            finally:
+                with self._backlog_lock:
+                    self._backlog = max(0.0, self._backlog - (segment.end - segment.start))

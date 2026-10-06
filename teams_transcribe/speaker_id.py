@@ -94,6 +94,10 @@ def get_embedder(hf_token: Optional[str], device: str) -> PyannoteEmbedder:
     with _embedder_cache_lock:
         embedder = _cached_embedder
         if embedder is None or embedder.key != (hf_token, device):
+            from teams_transcribe.whisper_stream import release_gpu_memory
+
+            _cached_embedder = embedder = None
+            release_gpu_memory()
             embedder = PyannoteEmbedder(hf_token, device)
             _cached_embedder = embedder
     embedder.load()

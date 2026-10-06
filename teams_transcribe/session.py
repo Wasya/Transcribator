@@ -94,11 +94,15 @@ class TranscriptionSession:
         self._system_wav: Optional[wave.Wave_write] = None
         self._sender_threads: list[threading.Thread] = []
         self._stop_senders = threading.Event()
+        # Copied from the streams at start(), so results that still trickle in
+        # after stop() has released the streams can be timestamped.
+        self._mic_started_at = None
+        self._system_started_at = None
 
     def _mic_result(self, start, duration, is_final, speaker_id, text):
         key: SpeakerKey = ("mic", None)
         name = self.store.speaker_name(key)
-        ts = self._mic_stream.started_at + timedelta(seconds=start)
+        ts = self._mic_started_at + timedelta(seconds=start)
         self.store.add_utterance(key, ts, is_final, text, start, duration)
         self.events.put(UIEvent(kind="utterance", speaker_key=key, speaker_name=name, text=text, is_final=is_final))
 
@@ -108,7 +112,7 @@ class TranscriptionSession:
         name, is_new = self.store.get_or_create_system_speaker_name(sid)
         if is_new:
             self.events.put(UIEvent(kind="new_speaker", speaker_key=key, speaker_name=name))
-        ts = self._system_stream.started_at + timedelta(seconds=start)
+        ts = self._system_started_at + timedelta(seconds=start)
         self.store.add_utterance(key, ts, is_final, text, start, duration)
         self.events.put(UIEvent(kind="utterance", speaker_key=key, speaker_name=name, text=text, is_final=is_final))
 
@@ -214,11 +218,13 @@ class TranscriptionSession:
             self._mic_device, diarize=False, endpointing=endpointing, on_result=self._mic_result
         )
         self._mic_stream.start()
+        self._mic_started_at = self._mic_stream.started_at
 
         self._system_stream = self._make_stream(
             self._system_device, diarize=True, endpointing=endpointing, on_result=self._system_result
         )
         self._system_stream.start()
+        self._system_started_at = self._system_stream.started_at
 
         self._mic_capture = MicCapture(self._pa, self._mic_device, self._mic_queue)
         self._mic_capture.start()
@@ -247,6 +253,14 @@ class TranscriptionSession:
     @property
     def system_level(self) -> float:
         return self._system_capture.level if self._system_capture is not None else 0.0
+
+    @property
+    def backlog_seconds(self) -> float:
+        """Speech waiting to be recognized (WhisperX only; 0 for Deepgram): how far
+        the transcript lags behind real time."""
+        return sum(
+            getattr(s, "backlog_seconds", 0.0) for s in (self._mic_stream, self._system_stream) if s is not None
+        )
 
     def rename_speaker(self, speaker_key: SpeakerKey, new_name: str) -> None:
         self.store.rename(speaker_key, new_name)
@@ -297,3 +311,11 @@ class TranscriptionSession:
         if self._pa is not None:
             self._pa.terminate()
             self._pa = None
+        # The finished session object outlives stop() (the GUI keeps it for
+        # re-export), so drop every reference to the models here; otherwise a
+        # model replaced in the cache would stay in GPU memory.
+        self._mic_stream = None
+        self._system_stream = None
+        self._engine = None
+        self._identifier = None
+        self._client = None

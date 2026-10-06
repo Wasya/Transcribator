@@ -56,9 +56,17 @@ def run_diarization(audio_16k: np.ndarray, hf_token: Optional[str], device: str)
     import torch  # noqa: F401  (first, so CUDA DLLs resolve before other native libs)
     from whisperx.diarize import DiarizationPipeline
 
+    from teams_transcribe.whisper_stream import release_gpu_memory
+
     pipeline = DiarizationPipeline(token=hf_token, device=device)
-    frame = pipeline(audio_16k)
-    return [(float(r.start), float(r.end), str(r.speaker)) for r in frame.itertuples()]
+    try:
+        frame = pipeline(audio_16k)
+        return [(float(r.start), float(r.end), str(r.speaker)) for r in frame.itertuples()]
+    finally:
+        # The pipeline is used once per session; without this torch keeps its
+        # GPU memory reserved and the next session's Whisper model gets squeezed.
+        del pipeline
+        release_gpu_memory()
 
 
 def diarize_system_wav(

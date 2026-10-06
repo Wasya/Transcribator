@@ -4,6 +4,7 @@ import queue
 import threading
 import tkinter as tk
 from pathlib import Path
+from tkinter import font as tkfont
 from tkinter import messagebox, scrolledtext, ttk
 
 import pyaudiowpatch as pyaudio
@@ -12,7 +13,7 @@ from naming import build_timestamped_name
 from teams_transcribe.audio_capture import LevelMonitor, list_input_devices, list_loopback_devices
 from teams_transcribe.exporter import export_session
 from teams_transcribe.config import Settings, resolve_whisper_runtime
-from teams_transcribe.transcript_store import TranscriptStore
+from teams_transcribe.transcript_store import TranscriptStore, merge_utterances
 from teams_transcribe.session import (
     BACKEND_DEEPGRAM,
     BACKEND_WHISPERX,
@@ -57,6 +58,7 @@ LANGUAGES = [
 ]
 
 LEVEL_FLOOR_DB = -60.0  # RMS at or below this shows as an empty meter
+DEFAULT_MERGE_GAP = 3.0  # seconds; see transcript_store.merge_utterances
 
 
 def level_to_percent(rms: float) -> int:
@@ -84,7 +86,14 @@ class App(tk.Tk):
         self._session: TranscriptionSession | None = None
         self._muted = False
         self._speaker_rows: dict[tuple, tk.Entry] = {}
-        self._interim_marks: dict[tuple, str] = {}
+        # The transcript box is a view of _view_store (current or last session):
+        # final utterances, merged per speaker, plus each speaker's in-progress
+        # (interim) text at the bottom. It is redrawn as a whole, so renaming a
+        # speaker immediately relabels all of their earlier lines too.
+        self._view_store: TranscriptStore | None = None
+        self._interims: dict[tuple, str] = {}
+        self._render_pending = False
+        self._recording = False  # session started and not yet stopped
 
         self._output_dir: Path | None = None
         # The most recently finished session: its speakers stay editable and
@@ -177,6 +186,17 @@ class App(tk.Tk):
             text="Убирать из транскрипта эхо микрофона (голоса собеседников из динамиков)",
             variable=self.drop_echo_var,
         ).grid(row=8, column=0, columnspan=2, sticky="w")
+
+        merge_row = ttk.Frame(top)
+        merge_row.grid(row=9, column=0, columnspan=4, sticky="w")
+        ttk.Label(merge_row, text="Не начинать новую реплику, если тот же голос молчал не дольше").pack(side="left")
+        self.merge_gap_var = tk.DoubleVar(value=DEFAULT_MERGE_GAP)
+        ttk.Spinbox(
+            merge_row, from_=0.0, to=15.0, increment=0.5, width=5, textvariable=self.merge_gap_var,
+            command=self._schedule_render,
+        ).pack(side="left", padx=4)
+        ttk.Label(merge_row, text="с (0 — каждая фраза отдельной строкой)").pack(side="left")
+        self.merge_gap_var.trace_add("write", lambda *_a: self._schedule_render())
         self._update_backend_widgets()
 
         buttons = ttk.Frame(self)
@@ -198,8 +218,15 @@ class App(tk.Tk):
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=8, pady=4)
 
-        self.transcript_box = scrolledtext.ScrolledText(body, width=70, height=25, state="disabled")
+        self.transcript_box = scrolledtext.ScrolledText(
+            body, width=70, height=25, state="disabled", wrap="word"
+        )
         self.transcript_box.pack(side="left", fill="both", expand=True)
+        self._bold_font = tkfont.nametofont(self.transcript_box.cget("font")).copy()
+        self._bold_font.configure(weight="bold")
+        self.transcript_box.tag_configure("name", font=self._bold_font)
+        self.transcript_box.tag_configure("time", foreground="#888")
+        self.transcript_box.tag_configure("interim", foreground="#888")
 
         speakers_frame = ttk.Frame(body)
         speakers_frame.pack(side="left", fill="y", padx=(8, 0))
@@ -245,6 +272,14 @@ class App(tk.Tk):
         system = level_to_percent(source.system_level) if source is not None else 0
         self.mic_level["value"] = mic
         self.system_level["value"] = system
+        session = self._session
+        if session is not None and self._recording and session.options.backend == BACKEND_WHISPERX:
+            lag = session.backlog_seconds
+            text = "Идёт запись…"
+            if lag >= 3.0:
+                text += f"  Распознавание отстаёт на {lag:.0f} с — попробуйте модель полегче."
+            if self.status_var.get() != text:
+                self.status_var.set(text)
         self.after(100, self._poll_levels)
 
     @staticmethod
@@ -339,10 +374,6 @@ class App(tk.Tk):
         for child in list(self.speakers_container.winfo_children()):
             child.destroy()
         self._speaker_rows.clear()
-        self._interim_marks.clear()
-        self.transcript_box.config(state="normal")
-        self.transcript_box.delete("1.0", "end")
-        self.transcript_box.config(state="disabled")
         self._muted = False
         self.mute_button.config(text="Заглушить микрофон")
         self.reexport_button.config(state="disabled")
@@ -351,6 +382,9 @@ class App(tk.Tk):
         mic = self._mic_devices[self.mic_combo.current()]
         system = self._system_devices[self.system_combo.current()]
         self._session = TranscriptionSession(mic, system, options)
+        self._view_store = self._session.store
+        self._interims.clear()
+        self._render_view()
         self.start_button.config(state="disabled")
 
         if options.backend == BACKEND_WHISPERX:
@@ -406,6 +440,7 @@ class App(tk.Tk):
             self._start_monitor()
             return
         self._set_status("Идёт запись…")
+        self._recording = True
         self.stop_button.config(state="normal")
         self.mute_button.config(state="normal")
         self.after(100, self._poll_events)
@@ -432,6 +467,7 @@ class App(tk.Tk):
             return
         session = self._session
         self._session = None
+        self._recording = False
         self.stop_button.config(state="disabled")
         self.mute_button.config(state="disabled")
         self._set_status("Остановка, доработка последних реплик…")
@@ -496,9 +532,11 @@ class App(tk.Tk):
                 )
             elif session.needs_diarization_pass:
                 # Speakers were re-labelled offline: rebuild the (still editable)
-                # speaker list and redraw the transcript with the new names.
+                # speaker list with the new names.
                 self._rebuild_speaker_rows(session.store)
-                self._render_transcript(session.store)
+            # Whatever was still interim when the connection closed never became final.
+            self._interims.clear()
+            self._render_view()
             if session.needs_diarization_pass and not session.options.record_audio:
                 (self._output_dir / "system.wav").unlink(missing_ok=True)
             self._last_session = session
@@ -518,8 +556,16 @@ class App(tk.Tk):
                 self.reexport_button.config(state="normal")
             self._start_monitor()
 
+    def _merge_gap(self) -> float:
+        try:
+            return max(0.0, float(self.merge_gap_var.get()))
+        except (tk.TclError, ValueError):  # the spinbox is mid-edit / not a number
+            return DEFAULT_MERGE_GAP
+
     def _export(self, store: TranscriptStore, output_dir: Path) -> int:
-        echo_count = export_session(store, output_dir, drop_mic_echo=self.drop_echo_var.get())
+        echo_count = export_session(
+            store, output_dir, drop_mic_echo=self.drop_echo_var.get(), merge_gap=self._merge_gap()
+        )
         log.info("export: %s mic utterances dropped as echo", echo_count)
         return echo_count
 
@@ -529,7 +575,7 @@ class App(tk.Tk):
             return
         try:
             self._export(self._last_session.store, self._last_output_dir)
-            self._render_transcript(self._last_session.store)
+            self._render_view()
             messagebox.showinfo("Готово", f"Транскрипт сохранён заново в:\n{self._last_output_dir.resolve()}")
         except Exception as exc:  # noqa: BLE001
             log.exception("re-export failed")
@@ -542,16 +588,37 @@ class App(tk.Tk):
         for key, name in store.system_speakers():
             self._add_speaker_row(key, name, store)
 
-    def _render_transcript(self, store: TranscriptStore) -> None:
-        """Replace the transcript box contents with the store's final utterances."""
-        self._interim_marks.clear()
-        self.transcript_box.config(state="normal")
-        self.transcript_box.delete("1.0", "end")
-        for u in sorted(store.final_utterances(), key=lambda u: u.timestamp):
-            name = store.speaker_name(u.speaker_key)
-            self.transcript_box.insert("end", f"[{u.timestamp:%H:%M:%S}] {name}: {u.text}\n")
-        self.transcript_box.see("end")
-        self.transcript_box.config(state="disabled")
+    def _schedule_render(self) -> None:
+        """Coalesce redraws: many events/keystrokes within 50 ms cost one render."""
+        if not self._render_pending:
+            self._render_pending = True
+            self.after(50, self._render_view)
+
+    def _render_view(self) -> None:
+        """Redraw the transcript box from _view_store: merged final lines with the
+        speakers' current names, then the in-progress (interim) lines in grey.
+        Keeps the user's scroll position unless they were already at the bottom."""
+        self._render_pending = False
+        box = self.transcript_box
+        at_bottom = box.yview()[1] >= 0.999
+        first_visible = box.yview()[0]
+        store = self._view_store
+        chunks: list = []
+        if store is not None:
+            for line in merge_utterances(store.final_utterances(), max_gap=self._merge_gap()):
+                chunks += [f"[{line.timestamp:%H:%M:%S}] ", "time",
+                           store.speaker_name(line.speaker_key), "name", f": {line.text}\n", ()]
+            for key, text in self._interims.items():
+                chunks += [store.speaker_name(key), "name", f": {text} …\n", "interim"]
+        box.config(state="normal")
+        box.delete("1.0", "end")
+        if chunks:
+            box.insert("end", *chunks)
+        if at_bottom:
+            box.see("end")
+        else:
+            box.yview_moveto(first_visible)
+        box.config(state="disabled")
 
     def _on_close(self) -> None:
         if self._session is not None:
@@ -597,7 +664,12 @@ class App(tk.Tk):
         if event.kind == "new_speaker":
             self._add_speaker_row(event.speaker_key, event.speaker_name, store)
         elif event.kind == "utterance":
-            self._update_transcript(event)
+            # The final text is already in the store; the view only tracks interims.
+            if event.is_final:
+                self._interims.pop(event.speaker_key, None)
+            else:
+                self._interims[event.speaker_key] = event.text
+            self._schedule_render()
         elif event.kind == "error":
             messagebox.showerror("Ошибка соединения", f"Сессия остановлена из-за ошибки:\n{event.text}")
             self._on_stop()
@@ -609,45 +681,19 @@ class App(tk.Tk):
             return
         row = ttk.Frame(self.speakers_container)
         row.pack(fill="x", pady=2)
-        ttk.Label(row, text=default_name + ":").pack(side="left")
+        ttk.Label(row, text=default_name + ":", foreground="#555").pack(side="left")
         var = tk.StringVar(value=default_name)
 
         def on_change(*_args, key=speaker_key, var=var, store=store):
             name = var.get().strip()
             if name:
                 store.rename(key, name)
+                self._schedule_render()  # relabel the speaker's earlier lines too
 
         entry = tk.Entry(row, textvariable=var, width=16)
         entry.pack(side="left", padx=4)
         var.trace_add("write", on_change)
         self._speaker_rows[speaker_key] = entry
-
-    def _update_transcript(self, event) -> None:
-        self.transcript_box.config(state="normal")
-
-        text = f"{event.speaker_name}: {event.text}"
-        mark = self._interim_marks.get(event.speaker_key)
-        if mark is not None:
-            # This speaker already has an in-progress line: replace just that
-            # line's content in place (never touching the line's own trailing
-            # newline), so other speakers' concurrently-updated lines are
-            # untouched and marks never collide at the same buffer index.
-            self.transcript_box.delete(f"{mark} linestart", f"{mark} lineend")
-            self.transcript_box.insert(f"{mark} linestart", text)
-            if event.is_final:
-                self.transcript_box.mark_unset(mark)
-                del self._interim_marks[event.speaker_key]
-        else:
-            insert_pos = self.transcript_box.index("end-1c")
-            self.transcript_box.insert("end", text + "\n")
-            if not event.is_final:
-                mark_name = f"interim_{event.speaker_key[0]}_{event.speaker_key[1]}"
-                self.transcript_box.mark_set(mark_name, insert_pos)
-                self.transcript_box.mark_gravity(mark_name, "left")
-                self._interim_marks[event.speaker_key] = mark_name
-
-        self.transcript_box.see("end")
-        self.transcript_box.config(state="disabled")
 
 
 def run(settings: Settings) -> None:

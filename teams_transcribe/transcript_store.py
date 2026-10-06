@@ -1,6 +1,6 @@
 import threading
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Optional
 
 SpeakerKey = tuple[str, Optional[int]]
@@ -14,6 +14,45 @@ class Utterance:
     text: str
     start: Optional[float] = None  # seconds from the start of the source's audio
     duration: Optional[float] = None
+
+
+@dataclass
+class TranscriptLine:
+    """Consecutive utterances of one speaker shown as a single line."""
+
+    speaker_key: SpeakerKey
+    timestamp: datetime
+    end: datetime
+    text: str
+    utterances: list[Utterance] = field(default_factory=list)
+
+
+def merge_utterances(
+    utterances: list[Utterance], *, max_gap: float = 3.0, max_seconds: float = 90.0
+) -> list[TranscriptLine]:
+    """Group utterances into lines: the next utterance of the same speaker joins the
+    current line when nobody else spoke in between and the pause is <= max_gap
+    seconds. The engines split speech at every short pause (a comma), which would
+    otherwise start a new "Собеседник N:" line each time. max_seconds caps a line
+    so a long monologue still breaks into readable paragraphs. max_gap <= 0
+    disables merging (one line per utterance)."""
+    lines: list[TranscriptLine] = []
+    for u in sorted(utterances, key=lambda u: u.timestamp):
+        end = u.timestamp + timedelta(seconds=u.duration or 0.0)
+        last = lines[-1] if lines else None
+        if (
+            max_gap > 0
+            and last is not None
+            and last.speaker_key == u.speaker_key
+            and (u.timestamp - last.end).total_seconds() <= max_gap
+            and (end - last.timestamp).total_seconds() <= max_seconds
+        ):
+            last.text = f"{last.text} {u.text}".strip()
+            last.end = max(last.end, end)
+            last.utterances.append(u)
+        else:
+            lines.append(TranscriptLine(u.speaker_key, u.timestamp, end, u.text, [u]))
+    return lines
 
 
 class TranscriptStore:
