@@ -280,6 +280,71 @@ class FileModeTests(unittest.TestCase):
             self.assertEqual(load_reference_text(p), "привет мир как дела просто строка")
 
 
+class DiarizationScoringTests(unittest.TestCase):
+    TURNS = [(0.0, "Анна"), (10.0, "Борис"), (20.0, "Вера")]  # reference: who starts speaking when
+
+    def _utts(self, labels):
+        """Six 5-second utterances: 0-5 and 5-10 Anna, 10-15 and 15-20 Boris, 20-25 and 25-30 Vera."""
+        from teams_transcribe.transcript_store import Utterance
+
+        return [
+            Utterance(("system", lab), datetime(2000, 1, 1) + timedelta(seconds=i * 5), True, "x", i * 5.0, 5.0)
+            for i, lab in enumerate(labels)
+        ]
+
+    def test_perfect_diarization(self):
+        from teams_transcribe.file_mode import score_diarization
+
+        r = score_diarization(self._utts([0, 0, 1, 1, 2, 2]), self.TURNS)
+        self.assertEqual((r["found"], r["real"]), (3, 3))
+        self.assertAlmostEqual(r["accuracy"], 1.0)
+        self.assertEqual(r["merged"] + r["split"], [])
+
+    def test_labels_are_matched_regardless_of_numbering(self):
+        from teams_transcribe.file_mode import score_diarization
+
+        self.assertAlmostEqual(score_diarization(self._utts([7, 7, 3, 3, 9, 9]), self.TURNS)["accuracy"], 1.0)
+
+    def test_two_people_merged(self):
+        from teams_transcribe.file_mode import score_diarization
+
+        r = score_diarization(self._utts([0, 0, 1, 1, 1, 1]), self.TURNS)  # Boris and Vera are one voice
+        self.assertEqual(r["found"], 2)
+        self.assertAlmostEqual(r["accuracy"], 4 / 6, places=2)  # Anna + Boris right, Vera lost
+        self.assertLess(r["purity"], 1.0)
+        self.assertAlmostEqual(r["completeness"], 1.0)
+        self.assertEqual(r["merged"], [("Г2", ["Борис", "Вера"])])
+
+    def test_one_person_split(self):
+        from teams_transcribe.file_mode import score_diarization
+
+        r = score_diarization(self._utts([0, 1, 2, 2, 3, 3]), self.TURNS)  # Anna got two voices
+        self.assertEqual(r["found"], 4)
+        self.assertLess(r["completeness"], 1.0)
+        self.assertAlmostEqual(r["purity"], 1.0)
+        self.assertEqual(r["split"], [("Анна", ["Г1", "Г2"])])
+
+    def test_explicit_offset_shifts_the_reference(self):
+        from teams_transcribe.file_mode import score_diarization
+
+        # the audio starts 5 s before the first reference line: Anna's turn is 5..15
+        utts = self._utts([0, 0, 1, 1, 2, 2])
+        self.assertLess(score_diarization(utts, self.TURNS, offset=5.0)["accuracy"], 1.0)
+
+    def test_reference_turns_are_parsed(self):
+        import tempfile
+        from pathlib import Path
+
+        from teams_transcribe.file_mode import load_reference_turns
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "t.txt"
+            p.write_text(chr(10).join(["[00:00:05] Анна: привет", "просто строка", "[01:02:03] Борис: пока", "[07:30] Вера: тест"]), encoding="utf-8")
+            self.assertEqual(load_reference_turns(p), [(5.0, "Анна"), (3723.0, "Борис"), (450.0, "Вера")])
+            p.write_text("без разметки", encoding="utf-8")
+            self.assertEqual(load_reference_turns(p), [])
+
+
 class ResamplerTests(unittest.TestCase):
     def test_48k_to_16k_length_and_chunk_continuity(self):
         x = tone(1.0, rate=48000)

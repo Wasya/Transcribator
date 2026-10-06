@@ -216,3 +216,95 @@ def compare_texts(reference: str, hypothesis: str) -> dict:
         "missing": missing,
         "extra": extra,
     }
+
+
+# ---------------------------------------------------------------- diarization scoring
+
+_TIMED_LINE = re.compile(r"^\s*\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]\s*([^:\n]{1,40}):")
+
+
+def load_reference_turns(path: Path) -> list[tuple[float, str]]:
+    """Speaker turns of a reference transcript: (seconds, speaker) per "[hh:mm:ss] Имя:"
+    line, in file order. Empty if the file has no timed, labelled lines."""
+    turns: list[tuple[float, str]] = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        m = _TIMED_LINE.match(line)
+        if not m:
+            continue
+        a, b, c, name = m.groups()
+        seconds = int(a) * 3600 + int(b) * 60 + int(c) if c is not None else int(a) * 60 + int(b)
+        turns.append((float(seconds), name.strip()))
+    return turns
+
+
+def score_diarization(
+    utterances, turns: list[tuple[float, str]], offset: Optional[float] = None, share: float = 0.10
+) -> Optional[dict]:
+    """Compare found speakers with the reference's speaker turns.
+
+    The reference gives only when each turn *starts* (as in our own transcript.txt),
+    so utterances are assigned to the turn their midpoint falls into. The reference
+    clock is aligned so that its first line starts where the first utterance does
+    (override with offset = seconds into the audio at which the first reference line
+    starts). Found speakers are matched to real ones one-to-one for maximum agreement
+    (Hungarian). accuracy = matched speech time / all speech time; purity = how much
+    of each found speaker is one real person (low = different people merged);
+    completeness = how much of each real person is one found speaker (low = one
+    person split). Time weights are utterance durations.
+    """
+    utts = [u for u in utterances if u.start is not None and u.speaker_key[0] == "system"]
+    if not utts or not turns:
+        return None
+    first = min(u.start for u in utts)
+    shift = (first if offset is None else offset) - turns[0][0]
+    ref_t = sorted((t + shift, n) for t, n in turns)
+
+    def ref_label(mid: float) -> str:
+        label = ref_t[0][1]
+        for t, n in ref_t:
+            if mid >= t:
+                label = n
+        return label
+
+    found = sorted({u.speaker_key for u in utts}, key=lambda k: (k[0], k[1] if k[1] is not None else -1))
+    real = list(dict.fromkeys(n for _, n in ref_t))
+    matrix = np.zeros((len(found), len(real)))
+    for u in utts:
+        d = u.duration or 0.0
+        matrix[found.index(u.speaker_key), real.index(ref_label(u.start + d / 2))] += d
+    total = matrix.sum()
+    if total <= 0:
+        return None
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        rows, cols = linear_sum_assignment(-matrix)
+        matched = float(matrix[rows, cols].sum())
+    except ImportError:  # greedy fallback
+        matched, used = 0.0, set()
+        for i in np.argsort(-matrix.max(axis=1)):
+            j = next((j for j in np.argsort(-matrix[i]) if j not in used), None)
+            if j is not None:
+                used.add(j)
+                matched += float(matrix[i, j])
+
+    merged, split = [], []
+    for i, row in enumerate(matrix):
+        parts = [real[j] for j in np.argsort(-row) if row.sum() and row[j] / row.sum() >= share]
+        if len(parts) > 1:
+            merged.append((f"Г{i + 1}", parts))
+    for j, col in enumerate(matrix.T):
+        parts = [f"Г{i + 1}" for i in np.argsort(-col) if col.sum() and col[i] / col.sum() >= share]
+        if len(parts) > 1:
+            split.append((real[j], parts))
+    return {
+        "found": len(found),
+        "real": len(real),
+        "accuracy": matched / total,
+        "purity": float(matrix.max(axis=1).sum() / total),
+        "completeness": float(matrix.max(axis=0).sum() / total),
+        "merged": merged,  # [(found speaker, [real speakers it mixes])]
+        "split": split,  # [(real speaker, [found speakers it was split into])]
+        "real_names": real,
+        "confusion": matrix.round(2).tolist(),
+    }

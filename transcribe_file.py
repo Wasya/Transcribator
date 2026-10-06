@@ -35,6 +35,8 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0, help="зерно случайных чисел для воспроизводимости (по умолчанию 0)")
     p.add_argument("--merge-gap", type=float, default=None, help="пауза склейки реплик одного голоса, с")
     p.add_argument("--reference", type=Path, help="эталонный текст (txt или transcript.txt) для сравнения")
+    p.add_argument("--reference-offset", type=float, default=None,
+                   help="на какой секунде звука начинается первая строка эталона (по умолчанию — с первой реплики)")
     p.add_argument("--out", type=Path, help="папка результатов (по умолчанию Output/File_<имя>_<время>)")
     return p.parse_args(argv)
 
@@ -56,7 +58,8 @@ def main(argv=None) -> int:
     from teams_transcribe.config import load_settings, resolve_whisper_runtime
     from teams_transcribe.exporter import export_session
     from teams_transcribe.file_mode import (
-        FileRunOptions, compare_texts, load_audio_16k, load_reference_text, transcribe_audio,
+        FileRunOptions, compare_texts, load_audio_16k, load_reference_text, load_reference_turns,
+        score_diarization, transcribe_audio,
     )
     from teams_transcribe.transcript_store import DEFAULT_MERGE_GAP
 
@@ -70,6 +73,8 @@ def main(argv=None) -> int:
 
     models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else [None]
     reference = load_reference_text(args.reference) if args.reference else None
+    ref_turns = load_reference_turns(args.reference) if args.reference else []
+    score_voices = bool(ref_turns) and args.diarization != "off"
     merge_gap = DEFAULT_MERGE_GAP if args.merge_gap is None else args.merge_gap
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -84,8 +89,11 @@ def main(argv=None) -> int:
     rows = [["модель", "устройство", "звук,с", "время,с", "x реал.", "кусков", "слов", "голосов"]]
     if reference is not None:
         rows[0] += ["схожесть", "WER~", "пропущено", "лишнего"]
+    if score_voices:
+        rows[0] += ["голосов в эталоне", "точность голосов", "чистота", "полнота"]
     summary = []
     details = []
+    voice_details = []
 
     for requested in models:
         model, device, compute_type = resolve_whisper_runtime(settings, requested)
@@ -116,6 +124,14 @@ def main(argv=None) -> int:
             row += [f"{cmp['similarity']:.3f}", f"{cmp['wer']:.3f}", str(len(cmp["missing"])), str(len(cmp["extra"]))]
             entry["comparison"] = cmp
             details.append((model, cmp))
+        if score_voices:
+            dia = score_diarization(result.store.final_utterances(), ref_turns, args.reference_offset)
+            if dia is None:
+                row += ["-", "-", "-", "-"]
+            else:
+                row += [str(dia["real"]), f"{dia['accuracy']:.3f}", f"{dia['purity']:.3f}", f"{dia['completeness']:.3f}"]
+                entry["diarization"] = dia
+                voice_details.append((model, dia))
         rows.append(row)
         summary.append(entry)
         print(f"  результат: {out_dir}")
@@ -128,8 +144,26 @@ def main(argv=None) -> int:
         text += [f"  - {m}" for m in cmp["missing"]] or ["  (нет)"]
         text.append(f"--- {model}: есть в результате, нет в эталоне (>=3 слов подряд):")
         text += [f"  + {m}" for m in cmp["extra"]] or ["  (нет)"]
+    for model, dia in voice_details:
+        text.append(f"\n--- {model}: разбор по голосам (найдено {dia['found']}, в эталоне {dia['real']}):")
+        text.append("  точность — доля речи, правильно отнесённой к своему человеку; чистота < 1 — разные люди слиты в один "
+                    "найденный голос; полнота < 1 — один человек раздроблен на несколько")
+        for found, parts in dia["merged"]:
+            text.append(f"  слиты: {found} = " + " + ".join(f"«{p}»" for p in parts))
+        for real_name, parts in dia["split"]:
+            text.append(f"  раздроблен: «{real_name}» → " + " + ".join(parts))
+        if not dia["merged"] and not dia["split"]:
+            text.append("  слияний и дроблений нет")
+        text.append("  (Г1, Г2, … — найденные голоса в порядке появления)")
     (base / "summary.txt").write_text("\n".join(text), encoding="utf-8")
     (base / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    for model, dia in voice_details:
+        print(f"\n{model}: голоса — найдено {dia['found']} из {dia['real']}, точность {dia['accuracy']:.3f}"
+              f" (чистота {dia['purity']:.3f}, полнота {dia['completeness']:.3f})")
+        for found, parts in dia["merged"]:
+            print(f"  слиты: {found} = " + " + ".join(f"«{p}»" for p in parts))
+        for real_name, parts in dia["split"]:
+            print(f"  раздроблен: «{real_name}» → " + " + ".join(parts))
     for model, cmp in details:
         print(f"\n{model}: пропущено {len(cmp['missing'])} фрагм., лишнего {len(cmp['extra'])} фрагм. (подробно — в summary.txt)")
     print(f"\nСводка: {base / 'summary.txt'}")
