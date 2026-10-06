@@ -58,6 +58,11 @@ class Segmenter:
 
     Feed arbitrary-sized chunks with feed(); finished segments are returned as they
     complete. flush() emits whatever speech is still pending (call it on stop).
+
+    Speech that runs longer than max_segment without a real pause (radio, a
+    monologue) is not cut blindly at the limit: the cut goes to the quietest
+    frame within the last cut_search seconds, and everything after it becomes
+    the beginning of the next segment, so words are not split in the middle.
     """
 
     FRAME = 480  # 30 ms at 16 kHz
@@ -68,58 +73,84 @@ class Segmenter:
         min_silence: float = 0.7,
         min_speech: float = 0.25,
         max_segment: float = 20.0,
+        cut_search: float = 3.0,
         preroll: float = 0.3,
         min_threshold: float = 0.006,
         noise_factor: float = 3.0,
     ):
         self._min_silence_frames = max(1, int(min_silence * TARGET_RATE / self.FRAME))
         self._min_speech_frames = max(1, int(min_speech * TARGET_RATE / self.FRAME))
-        self._max_frames = int(max_segment * TARGET_RATE / self.FRAME)
+        self._max_frames = max(2, int(max_segment * TARGET_RATE / self.FRAME))
+        # Never look back further than half the segment, so the emitted part keeps a sane length.
+        self._cut_search_frames = max(1, min(int(cut_search * TARGET_RATE / self.FRAME), self._max_frames // 2))
         self._preroll_frames = int(preroll * TARGET_RATE / self.FRAME)
         self._min_threshold = min_threshold
         self._noise_factor = noise_factor
         self._noise_floor = 0.0
         self._pending = np.zeros(0, dtype=np.float32)
         self._frame_index = 0  # index of the next frame to be consumed
-        self._preroll: list[np.ndarray] = []
-        self._frames: list[np.ndarray] = []
+        # Per-frame records (audio, rms, is_speech) of the pre-roll ring and the open segment.
+        self._preroll: list[_Frame] = []
+        self._frames: list[_Frame] = []
         self._start_frame = 0
         self._in_speech = False
         self._silence_run = 0
         self._speech_frames = 0
 
-    def _is_speech(self, frame: np.ndarray) -> bool:
+    def _classify(self, frame: np.ndarray) -> "_Frame":
         rms = float(np.sqrt(np.mean(frame * frame)))
         threshold = max(self._min_threshold, self._noise_factor * self._noise_floor)
         speech = rms > threshold
         if not speech:
             self._noise_floor = rms if self._noise_floor == 0.0 else 0.95 * self._noise_floor + 0.05 * rms
-        return speech
+        return _Frame(frame, rms, speech)
+
+    def _make_segment(self, frames: list["_Frame"], start_frame: int) -> Segment:
+        audio = np.concatenate([f.audio for f in frames])
+        start = start_frame * self.FRAME / TARGET_RATE
+        return Segment(audio=audio, start=start, end=start + len(audio) / TARGET_RATE)
 
     def _emit(self, trailing_silence: int) -> Optional[Segment]:
+        """Close the open segment at a pause (or on flush)."""
         frames = self._frames
         if trailing_silence:
             frames = frames[: len(frames) - trailing_silence + min(trailing_silence, 3)]
         speech = self._speech_frames
+        start_frame = self._start_frame
         self._frames = []
         self._in_speech = False
         self._silence_run = 0
         self._speech_frames = 0
         if speech < self._min_speech_frames or not frames:
             return None
-        audio = np.concatenate(frames)
-        start = self._start_frame * self.FRAME / TARGET_RATE
-        return Segment(audio=audio, start=start, end=start + len(audio) / TARGET_RATE)
+        return self._make_segment(frames, start_frame)
+
+    def _split_at_quietest(self) -> Optional[Segment]:
+        """The segment hit max_segment without a pause: cut it at the quietest
+        frame of the search window and keep the tail as the next segment's start."""
+        frames = self._frames
+        window_start = len(frames) - self._cut_search_frames
+        cut = min(range(window_start, len(frames)), key=lambda i: frames[i].rms)
+        head, tail = frames[:cut], frames[cut:]
+        head_speech = sum(1 for f in head if f.speech)
+        head_start = self._start_frame
+
+        self._frames = tail
+        self._start_frame += cut
+        self._speech_frames = sum(1 for f in tail if f.speech)
+        self._silence_run = min(self._silence_run, len(tail))
+        if head_speech < self._min_speech_frames or not head:
+            return None
+        return self._make_segment(head, head_start)
 
     def feed(self, samples: np.ndarray) -> list[Segment]:
         self._pending = np.concatenate([self._pending, samples])
         out: list[Segment] = []
         while len(self._pending) >= self.FRAME:
-            frame = self._pending[: self.FRAME]
+            frame = self._classify(self._pending[: self.FRAME])
             self._pending = self._pending[self.FRAME:]
-            speech = self._is_speech(frame)
             if not self._in_speech:
-                if speech:
+                if frame.speech:
                     self._in_speech = True
                     self._frames = list(self._preroll) + [frame]
                     self._start_frame = self._frame_index - len(self._preroll)
@@ -132,7 +163,7 @@ class Segmenter:
                         self._preroll.pop(0)
             else:
                 self._frames.append(frame)
-                if speech:
+                if frame.speech:
                     self._silence_run = 0
                     self._speech_frames += 1
                 else:
@@ -142,7 +173,7 @@ class Segmenter:
                     if seg:
                         out.append(seg)
                 elif len(self._frames) >= self._max_frames:
-                    seg = self._emit(0)
+                    seg = self._split_at_quietest()
                     if seg:
                         out.append(seg)
             self._frame_index += 1
@@ -153,3 +184,10 @@ class Segmenter:
             seg = self._emit(self._silence_run)
             return [seg] if seg else []
         return []
+
+
+@dataclass
+class _Frame:
+    audio: np.ndarray
+    rms: float
+    speech: bool

@@ -57,14 +57,22 @@ class PyannoteEmbedder:
         self._inference = None
         self._lock = threading.Lock()
 
-    def load(self) -> None:
-        import torch  # noqa: F401  (imported first so CUDA DLLs resolve before other native libs)
-        from pyannote.audio import Inference, Model
+    @property
+    def key(self) -> tuple[Optional[str], str]:
+        return (self._hf_token, self._device)
 
-        model = Model.from_pretrained(EMBEDDING_MODEL, token=self._hf_token)
-        inference = Inference(model, window="whole")
-        inference.to(torch.device(self._device))
-        self._inference = inference
+    def load(self) -> None:
+        """Load the embedding model; a no-op if it is already loaded."""
+        with self._lock:
+            if self._inference is not None:
+                return
+            import torch  # noqa: F401  (imported first so CUDA DLLs resolve before other native libs)
+            from pyannote.audio import Inference, Model
+
+            model = Model.from_pretrained(EMBEDDING_MODEL, token=self._hf_token)
+            inference = Inference(model, window="whole")
+            inference.to(torch.device(self._device))
+            self._inference = inference
 
     def __call__(self, audio: np.ndarray) -> np.ndarray:
         import torch
@@ -73,6 +81,23 @@ class PyannoteEmbedder:
             waveform = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)).unsqueeze(0)
             emb = self._inference({"waveform": waveform, "sample_rate": TARGET_RATE})
         return np.asarray(emb, dtype=np.float32).reshape(-1)
+
+
+_embedder_cache_lock = threading.Lock()
+_cached_embedder: Optional[PyannoteEmbedder] = None
+
+
+def get_embedder(hf_token: Optional[str], device: str) -> PyannoteEmbedder:
+    """Return a loaded PyannoteEmbedder, reusing the previous session's instance
+    when token and device are unchanged (see whisper_stream.get_engine)."""
+    global _cached_embedder
+    with _embedder_cache_lock:
+        embedder = _cached_embedder
+        if embedder is None or embedder.key != (hf_token, device):
+            embedder = PyannoteEmbedder(hf_token, device)
+            _cached_embedder = embedder
+    embedder.load()
+    return embedder
 
 
 class OnlineSpeakerIdentifier:

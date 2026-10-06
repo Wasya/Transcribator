@@ -169,16 +169,16 @@ class TranscriptionSession:
 
             self._client = DeepgramClient(api_key=opts.deepgram_api_key)
             return
-        from teams_transcribe.whisper_stream import WhisperEngine
+        from teams_transcribe.whisper_stream import get_engine
 
-        self._engine = WhisperEngine(opts.whisper_model, opts.whisper_device, opts.whisper_compute_type)
-        self._engine.load()
+        # Models are cached across sessions (process-wide), so a second "Start"
+        # with the same settings skips the slow load.
+        self._engine = get_engine(opts.whisper_model, opts.whisper_device, opts.whisper_compute_type)
         if opts.diarization in (DIARIZE_LIVE, DIARIZE_BOTH):
-            from teams_transcribe.speaker_id import OnlineSpeakerIdentifier, PyannoteEmbedder
+            from teams_transcribe.speaker_id import OnlineSpeakerIdentifier, get_embedder
 
-            embedder = PyannoteEmbedder(opts.hf_token, opts.whisper_device)
-            embedder.load()
-            self._identifier = OnlineSpeakerIdentifier(embedder)
+            # The identifier itself (speaker centroids) is fresh for every session.
+            self._identifier = OnlineSpeakerIdentifier(get_embedder(opts.hf_token, opts.whisper_device))
 
     def _make_stream(self, device: DeviceInfo, *, diarize: bool, endpointing: int, on_result):
         if self.options.backend == BACKEND_DEEPGRAM:
@@ -239,6 +239,14 @@ class TranscriptionSession:
     def set_muted(self, muted: bool) -> None:
         if self._mic_capture is not None:
             self._mic_capture.set_muted(muted)
+
+    @property
+    def mic_level(self) -> float:
+        return self._mic_capture.level if self._mic_capture is not None else 0.0
+
+    @property
+    def system_level(self) -> float:
+        return self._system_capture.level if self._system_capture is not None else 0.0
 
     def rename_speaker(self, speaker_key: SpeakerKey, new_name: str) -> None:
         self.store.rename(speaker_key, new_name)

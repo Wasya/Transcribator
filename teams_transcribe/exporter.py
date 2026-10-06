@@ -2,13 +2,21 @@ import json
 from pathlib import Path
 
 from naming import sanitize_name_component
+from teams_transcribe.echo_filter import find_mic_echo
 from teams_transcribe.transcript_store import TranscriptStore
 
 
-def export_session(store: TranscriptStore, output_dir: Path) -> None:
-    """Write transcript.txt, transcript.json and speakers/<Имя>.txt into output_dir."""
+def export_session(store: TranscriptStore, output_dir: Path, *, drop_mic_echo: bool = True) -> int:
+    """Write transcript.txt, transcript.json and speakers/<Имя>.txt into output_dir.
+
+    With drop_mic_echo, mic utterances that only repeat what the system channel
+    heard (remote voices leaking from the speakers) are left out of transcript.txt
+    and the per-speaker files; transcript.json keeps them flagged "mic_echo": true.
+    Returns the number of utterances treated as echo.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     utterances = sorted(store.final_utterances(), key=lambda u: u.timestamp)
+    echo = find_mic_echo(utterances) if drop_mic_echo else set()
 
     txt_lines: list[str] = []
     json_entries: list[dict] = []
@@ -16,8 +24,7 @@ def export_session(store: TranscriptStore, output_dir: Path) -> None:
 
     for u in utterances:
         name = store.speaker_name(u.speaker_key)
-        time_str = u.timestamp.strftime("%H:%M:%S")
-        txt_lines.append(f"[{time_str}] {name}: {u.text}")
+        is_echo = id(u) in echo
         json_entries.append(
             {
                 "speaker_source": u.speaker_key[0],
@@ -25,9 +32,14 @@ def export_session(store: TranscriptStore, output_dir: Path) -> None:
                 "speaker_name": name,
                 "timestamp": u.timestamp.isoformat(),
                 "is_final": u.is_final,
+                "mic_echo": is_echo,
                 "text": u.text,
             }
         )
+        if is_echo:
+            continue
+        time_str = u.timestamp.strftime("%H:%M:%S")
+        txt_lines.append(f"[{time_str}] {name}: {u.text}")
         per_speaker.setdefault(name, []).append(u.text)
 
     (output_dir / "transcript.txt").write_text("\n".join(txt_lines), encoding="utf-8")
@@ -44,3 +56,4 @@ def export_session(store: TranscriptStore, output_dir: Path) -> None:
         used_filenames[safe_name] = count + 1
         filename = f"{safe_name}.txt" if count == 0 else f"{safe_name}_{count + 1}.txt"
         (speakers_dir / filename).write_text("\n".join(texts), encoding="utf-8")
+    return len(echo)

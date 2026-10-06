@@ -1,4 +1,5 @@
 import logging
+import math
 import queue
 import threading
 import tkinter as tk
@@ -8,9 +9,10 @@ from tkinter import messagebox, scrolledtext, ttk
 import pyaudiowpatch as pyaudio
 
 from naming import build_timestamped_name
-from teams_transcribe.audio_capture import list_input_devices, list_loopback_devices
+from teams_transcribe.audio_capture import LevelMonitor, list_input_devices, list_loopback_devices
 from teams_transcribe.exporter import export_session
 from teams_transcribe.config import Settings, resolve_whisper_runtime
+from teams_transcribe.transcript_store import TranscriptStore
 from teams_transcribe.session import (
     BACKEND_DEEPGRAM,
     BACKEND_WHISPERX,
@@ -54,6 +56,17 @@ LANGUAGES = [
     ("Мультиязычный (code-switching)", "multi"),
 ]
 
+LEVEL_FLOOR_DB = -60.0  # RMS at or below this shows as an empty meter
+
+
+def level_to_percent(rms: float) -> int:
+    """Map RMS (0..1) to a 0..100 meter position on a dB scale, so quiet speech is visible."""
+    if rms <= 0.0:
+        return 0
+    db = 20.0 * math.log10(rms)
+    return int(max(0.0, min(100.0, (db - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB * 100.0)))
+
+
 CONSENT_NOTICE = (
     "Это приложение записывает и расшифровывает весь разговор, включая\n"
     "голоса удалённых участников. Получение согласия участников на запись\n"
@@ -74,6 +87,11 @@ class App(tk.Tk):
         self._interim_marks: dict[tuple, str] = {}
 
         self._output_dir: Path | None = None
+        # The most recently finished session: its speakers stay editable and
+        # "Сохранить заново" re-exports it with the new names.
+        self._last_session: TranscriptionSession | None = None
+        self._last_output_dir: Path | None = None
+        self._monitor: LevelMonitor | None = None
 
         self._pa = pyaudio.PyAudio()
         self._mic_devices = list_input_devices(self._pa)
@@ -81,6 +99,8 @@ class App(tk.Tk):
 
         self._build_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._start_monitor()
+        self.after(100, self._poll_levels)
         messagebox.showinfo("Перед началом", CONSENT_NOTICE)
 
     def _build_widgets(self) -> None:
@@ -94,6 +114,9 @@ class App(tk.Tk):
         if self._mic_devices:
             self.mic_combo.current(0)
         self.mic_combo.grid(row=0, column=1, sticky="w", padx=4)
+        self.mic_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_device_change())
+        self.mic_level = ttk.Progressbar(top, orient="horizontal", length=120, mode="determinate", maximum=100)
+        self.mic_level.grid(row=0, column=2, sticky="w", padx=4)
 
         ttk.Label(top, text="Системный звук:").grid(row=1, column=0, sticky="w")
         self.system_combo = ttk.Combobox(
@@ -102,6 +125,13 @@ class App(tk.Tk):
         if self._system_devices:
             self.system_combo.current(0)
         self.system_combo.grid(row=1, column=1, sticky="w", padx=4)
+        self.system_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_device_change())
+        self.system_level = ttk.Progressbar(top, orient="horizontal", length=120, mode="determinate", maximum=100)
+        self.system_level.grid(row=1, column=2, sticky="w", padx=4)
+        ttk.Label(
+            top, text="← уровень звука: говорите в микрофон / включите звук в звонке — полоски должны двигаться",
+            foreground="#555",
+        ).grid(row=0, column=3, rowspan=2, sticky="w", padx=4)
 
         ttk.Label(top, text="Язык распознавания:").grid(row=2, column=0, sticky="w")
         self.lang_combo = ttk.Combobox(
@@ -140,6 +170,13 @@ class App(tk.Tk):
         ttk.Checkbutton(
             top, text="Сохранять сырое аудио (WAV)", variable=self.record_wav_var
         ).grid(row=7, column=0, columnspan=2, sticky="w")
+
+        self.drop_echo_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            top,
+            text="Убирать из транскрипта эхо микрофона (голоса собеседников из динамиков)",
+            variable=self.drop_echo_var,
+        ).grid(row=8, column=0, columnspan=2, sticky="w")
         self._update_backend_widgets()
 
         buttons = ttk.Frame(self)
@@ -150,6 +187,10 @@ class App(tk.Tk):
         self.stop_button.pack(side="left", padx=4)
         self.mute_button = ttk.Button(buttons, text="Заглушить микрофон", command=self._on_mute_toggle, state="disabled")
         self.mute_button.pack(side="left", padx=4)
+        self.reexport_button = ttk.Button(
+            buttons, text="Сохранить заново", command=self._on_reexport, state="disabled"
+        )
+        self.reexport_button.pack(side="left", padx=(16, 4))
 
         self.status_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.status_var, foreground="#555").pack(fill="x", padx=8)
@@ -165,6 +206,46 @@ class App(tk.Tk):
         ttk.Label(speakers_frame, text="Участники:").pack(anchor="w")
         self.speakers_container = ttk.Frame(speakers_frame)
         self.speakers_container.pack(fill="y")
+        ttk.Label(
+            speakers_frame,
+            text="Имена можно менять и после «Стоп» —\nзатем нажмите «Сохранить заново».",
+            foreground="#555",
+        ).pack(anchor="w", pady=(8, 0))
+
+    # --- level meters -----------------------------------------------------
+
+    def _selected_device(self, devices, combo):
+        return devices[combo.current()] if devices and combo.current() >= 0 else None
+
+    def _start_monitor(self) -> None:
+        self._stop_monitor()
+        if self._session is not None:
+            return  # the session's own captures feed the meters
+        self._monitor = LevelMonitor(
+            self._pa,
+            self._selected_device(self._mic_devices, self.mic_combo),
+            self._selected_device(self._system_devices, self.system_combo),
+        )
+        self._monitor.start()
+        for name, exc in self._monitor.errors().items():
+            log.warning("level monitor: %s device failed to open: %s", name, exc)
+
+    def _stop_monitor(self) -> None:
+        if self._monitor is not None:
+            self._monitor.stop()
+            self._monitor = None
+
+    def _on_device_change(self) -> None:
+        if self._session is None:
+            self._start_monitor()
+
+    def _poll_levels(self) -> None:
+        source = self._session if self._session is not None else self._monitor
+        mic = level_to_percent(source.mic_level) if source is not None else 0
+        system = level_to_percent(source.system_level) if source is not None else 0
+        self.mic_level["value"] = mic
+        self.system_level["value"] = system
+        self.after(100, self._poll_levels)
 
     @staticmethod
     def _resolve_output_dir(base_name: str) -> Path:
@@ -259,14 +340,18 @@ class App(tk.Tk):
             child.destroy()
         self._speaker_rows.clear()
         self._interim_marks.clear()
+        self.transcript_box.config(state="normal")
+        self.transcript_box.delete("1.0", "end")
+        self.transcript_box.config(state="disabled")
         self._muted = False
         self.mute_button.config(text="Заглушить микрофон")
+        self.reexport_button.config(state="disabled")
+        self._last_session = None
 
         mic = self._mic_devices[self.mic_combo.current()]
         system = self._system_devices[self.system_combo.current()]
         self._session = TranscriptionSession(mic, system, options)
         self.start_button.config(state="disabled")
-        self._busy = True
 
         if options.backend == BACKEND_WHISPERX:
             self._set_status("Загрузка моделей (при первом запуске — скачивание, может занять минуты)…")
@@ -280,14 +365,24 @@ class App(tk.Tk):
                 log.exception("prepare failed")
                 self._work_queue.put(("prepared", session, exc))
 
-        threading.Thread(target=prepare, daemon=True).start()
-        self.after(150, self._poll_work)
+        self._start_background_work(prepare)
+
+    def _start_background_work(self, target) -> None:
+        """Run target on a daemon thread and poll self._work_queue until the
+        work reports completion (which clears self._busy)."""
+        already_polling = self._busy
+        self._busy = True
+        threading.Thread(target=target, daemon=True).start()
+        if not already_polling:
+            self.after(150, self._poll_work)
 
     def _finish_start(self, session: TranscriptionSession, error: Exception | None) -> None:
         self._busy = False
         if session is not self._session:
             return
         if error is None:
+            # Release the devices held by the level monitor before the session opens them.
+            self._stop_monitor()
             try:
                 session.start()
             except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
@@ -308,6 +403,7 @@ class App(tk.Tk):
             self._session = None
             self._set_status("")
             self.start_button.config(state="normal")
+            self._start_monitor()
             return
         self._set_status("Идёт запись…")
         self.stop_button.config(state="normal")
@@ -322,9 +418,10 @@ class App(tk.Tk):
                     self._finish_start(payload, extra)
                 elif kind == "status":
                     self._set_status(payload)
-                elif kind == "diarized":
+                elif kind == "stopped":
                     self._busy = False
-                    self._finish_stop(payload, extra)
+                    stop_error, diar_error = extra
+                    self._finish_stop(payload, stop_error, diar_error)
         except queue.Empty:
             pass
         if self._busy:
@@ -338,51 +435,77 @@ class App(tk.Tk):
         self.stop_button.config(state="disabled")
         self.mute_button.config(state="disabled")
         self._set_status("Остановка, доработка последних реплик…")
-        try:
-            session.stop()
-        except Exception as exc:
-            log.exception("stop failed")
-            messagebox.showwarning("Предупреждение", f"Ошибка при остановке сессии: {exc}")
 
+        # session.stop() can block for a long time with WhisperX (it waits for
+        # the recognizer to finish the backlog of segments), so it runs on a
+        # worker thread together with the optional diarization pass; the GUI
+        # keeps responding and shows progress via the "status" work events.
         wav = self._output_dir / "system.wav"
-        if session.needs_diarization_pass and wav.exists():
-            from teams_transcribe.postprocess import diarize_system_wav
+        opts = session.options
+        status = lambda t: self._work_queue.put(("status", t, None))  # noqa: E731
 
-            opts = session.options
-
-            def work():
-                err = None
+        def work():
+            stop_error = None
+            diar_error = None
+            try:
+                session.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.exception("stop failed")
+                stop_error = exc
+            if session.needs_diarization_pass and wav.exists():
+                status("Разбор по голосам…")
                 try:
+                    from teams_transcribe.postprocess import diarize_system_wav
+
                     n = diarize_system_wav(
-                        wav, session.store, opts.hf_token, opts.whisper_device,
-                        progress=lambda t: self._work_queue.put(("status", t, None)),
+                        wav, session.store, opts.hf_token, opts.whisper_device, progress=status
                     )
                     log.info("diarization pass: %s speakers", n)
                 except Exception as exc:  # noqa: BLE001
                     log.exception("diarization pass failed")
-                    err = exc
-                self._work_queue.put(("diarized", session, err))
+                    diar_error = exc
+            self._work_queue.put(("stopped", session, (stop_error, diar_error)))
 
-            self._set_status("Разбор по голосам…")
-            self._busy = True
-            threading.Thread(target=work, daemon=True).start()
-            self.after(150, self._poll_work)
-        else:
-            self._finish_stop(session, None)
+        self._start_background_work(work)
 
-    def _finish_stop(self, session: TranscriptionSession, diar_error: Exception | None) -> None:
+    def _show_trailing_events(self, session: TranscriptionSession) -> None:
+        """Display utterances that arrived while the session was shutting down
+        (_poll_events stops as soon as the session is detached)."""
+        while True:
+            try:
+                event = session.events.get_nowait()
+            except queue.Empty:
+                return
+            if event.kind in ("new_speaker", "utterance"):
+                self._handle_event(event, session.store)
+
+    def _finish_stop(
+        self,
+        session: TranscriptionSession,
+        stop_error: Exception | None,
+        diar_error: Exception | None,
+    ) -> None:
         try:
+            self._show_trailing_events(session)
+            if stop_error is not None:
+                messagebox.showwarning("Предупреждение", f"Ошибка при остановке сессии: {stop_error}")
             if diar_error is not None:
                 messagebox.showwarning(
                     "Разбор по голосам не удался",
                     f"{diar_error}\n\nТранскрипт сохранён с разметкой, полученной во время звонка.",
                 )
             elif session.needs_diarization_pass:
-                self._rebuild_speaker_rows(session)
+                # Speakers were re-labelled offline: rebuild the (still editable)
+                # speaker list and redraw the transcript with the new names.
+                self._rebuild_speaker_rows(session.store)
+                self._render_transcript(session.store)
             if session.needs_diarization_pass and not session.options.record_audio:
                 (self._output_dir / "system.wav").unlink(missing_ok=True)
-            export_session(session.store, self._output_dir)
-            messagebox.showinfo("Готово", f"Транскрипт сохранён в:\n{self._output_dir.resolve()}")
+            self._last_session = session
+            self._last_output_dir = self._output_dir
+            echo_count = self._export(session.store, self._output_dir)
+            note = f"\n\nУбрано реплик-эхо микрофона: {echo_count}" if echo_count else ""
+            messagebox.showinfo("Готово", f"Транскрипт сохранён в:\n{self._output_dir.resolve()}{note}")
         except Exception as exc:
             log.exception("export failed")
             messagebox.showerror("Ошибка экспорта", str(exc))
@@ -391,13 +514,44 @@ class App(tk.Tk):
             self.start_button.config(state="normal")
             self.stop_button.config(state="disabled")
             self.mute_button.config(state="disabled")
+            if self._last_session is not None:
+                self.reexport_button.config(state="normal")
+            self._start_monitor()
 
-    def _rebuild_speaker_rows(self, session: TranscriptionSession) -> None:
+    def _export(self, store: TranscriptStore, output_dir: Path) -> int:
+        echo_count = export_session(store, output_dir, drop_mic_echo=self.drop_echo_var.get())
+        log.info("export: %s mic utterances dropped as echo", echo_count)
+        return echo_count
+
+    def _on_reexport(self) -> None:
+        """Re-save the last finished session after the user edited speaker names."""
+        if self._last_session is None or self._last_output_dir is None:
+            return
+        try:
+            self._export(self._last_session.store, self._last_output_dir)
+            self._render_transcript(self._last_session.store)
+            messagebox.showinfo("Готово", f"Транскрипт сохранён заново в:\n{self._last_output_dir.resolve()}")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("re-export failed")
+            messagebox.showerror("Ошибка экспорта", str(exc))
+
+    def _rebuild_speaker_rows(self, store: TranscriptStore) -> None:
         for child in list(self.speakers_container.winfo_children()):
             child.destroy()
         self._speaker_rows.clear()
-        for key, name in session.store.system_speakers():
-            ttk.Label(self.speakers_container, text=name).pack(anchor="w")
+        for key, name in store.system_speakers():
+            self._add_speaker_row(key, name, store)
+
+    def _render_transcript(self, store: TranscriptStore) -> None:
+        """Replace the transcript box contents with the store's final utterances."""
+        self._interim_marks.clear()
+        self.transcript_box.config(state="normal")
+        self.transcript_box.delete("1.0", "end")
+        for u in sorted(store.final_utterances(), key=lambda u: u.timestamp):
+            name = store.speaker_name(u.speaker_key)
+            self.transcript_box.insert("end", f"[{u.timestamp:%H:%M:%S}] {name}: {u.text}\n")
+        self.transcript_box.see("end")
+        self.transcript_box.config(state="disabled")
 
     def _on_close(self) -> None:
         if self._session is not None:
@@ -413,6 +567,7 @@ class App(tk.Tk):
                 "Идёт загрузка или разбор по голосам. Окно можно закрыть, когда появится сообщение «Готово».",
             )
             return
+        self._stop_monitor()
         self._pa.terminate()
         self.destroy()
 
@@ -428,7 +583,7 @@ class App(tk.Tk):
         try:
             while True:
                 event = self._session.events.get_nowait()
-                self._handle_event(event)
+                self._handle_event(event, self._session.store)
                 if self._session is None:
                     # _handle_event triggered an auto-stop (e.g. an error
                     # event), tearing down the session - don't keep pulling
@@ -438,16 +593,18 @@ class App(tk.Tk):
             pass
         self.after(100, self._poll_events)
 
-    def _handle_event(self, event) -> None:
+    def _handle_event(self, event, store: TranscriptStore) -> None:
         if event.kind == "new_speaker":
-            self._add_speaker_row(event.speaker_key, event.speaker_name)
+            self._add_speaker_row(event.speaker_key, event.speaker_name, store)
         elif event.kind == "utterance":
             self._update_transcript(event)
         elif event.kind == "error":
             messagebox.showerror("Ошибка соединения", f"Сессия остановлена из-за ошибки:\n{event.text}")
             self._on_stop()
 
-    def _add_speaker_row(self, speaker_key, default_name: str) -> None:
+    def _add_speaker_row(self, speaker_key, default_name: str, store: TranscriptStore) -> None:
+        """One editable row per speaker. Renames go straight to the given store,
+        which keeps working after the session has stopped (for re-export)."""
         if speaker_key in self._speaker_rows:
             return
         row = ttk.Frame(self.speakers_container)
@@ -455,9 +612,10 @@ class App(tk.Tk):
         ttk.Label(row, text=default_name + ":").pack(side="left")
         var = tk.StringVar(value=default_name)
 
-        def on_change(*_args, key=speaker_key, var=var):
-            if self._session is not None:
-                self._session.rename_speaker(key, var.get())
+        def on_change(*_args, key=speaker_key, var=var, store=store):
+            name = var.get().strip()
+            if name:
+                store.rename(key, name)
 
         entry = tk.Entry(row, textvariable=var, width=16)
         entry.pack(side="left", padx=4)

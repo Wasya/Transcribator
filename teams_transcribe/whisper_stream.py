@@ -20,16 +20,24 @@ class WhisperEngine:
         self._model = None
         self._lock = threading.Lock()
 
-    def load(self) -> None:
-        if self.device == "cuda":
-            try:
-                # Importing torch first lets ctranslate2 find the CUDA DLLs bundled with it.
-                import torch  # noqa: F401
-            except ImportError:
-                pass
-        from faster_whisper import WhisperModel
+    @property
+    def key(self) -> tuple[str, str, str]:
+        return (self.model_name, self.device, self.compute_type)
 
-        self._model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type)
+    def load(self) -> None:
+        """Load the model; a no-op if it is already loaded."""
+        with self._lock:
+            if self._model is not None:
+                return
+            if self.device == "cuda":
+                try:
+                    # Importing torch first lets ctranslate2 find the CUDA DLLs bundled with it.
+                    import torch  # noqa: F401
+                except ImportError:
+                    pass
+            from faster_whisper import WhisperModel
+
+            self._model = WhisperModel(self.model_name, device=self.device, compute_type=self.compute_type)
 
     def transcribe(self, audio, language: str) -> str:
         lang = None if language == "multi" else language
@@ -42,6 +50,24 @@ class WhisperEngine:
                 condition_on_previous_text=False,
             )
             return " ".join(s.text.strip() for s in segments).strip()
+
+
+_engine_cache_lock = threading.Lock()
+_cached_engine: Optional[WhisperEngine] = None
+
+
+def get_engine(model_name: str, device: str, compute_type: str) -> WhisperEngine:
+    """Return a loaded WhisperEngine, reusing the one from the previous session
+    when the (model, device, compute_type) triple is unchanged. Only one engine
+    is kept so switching models does not pile up copies in (GPU) memory."""
+    global _cached_engine
+    with _engine_cache_lock:
+        engine = _cached_engine
+        if engine is None or engine.key != (model_name, device, compute_type):
+            engine = WhisperEngine(model_name, device, compute_type)
+            _cached_engine = engine
+    engine.load()
+    return engine
 
 
 class WhisperStream:
