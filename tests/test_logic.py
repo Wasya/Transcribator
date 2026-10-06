@@ -125,6 +125,95 @@ class Mp3ExportTests(unittest.TestCase):
             self.assertFalse((d / "mic.mp3").exists())
 
 
+class PromptContextTests(unittest.TestCase):
+    def test_context_is_used_then_goes_stale(self):
+        from teams_transcribe.whisper_stream import PromptContext
+
+        c = PromptContext(max_age=10.0)
+        self.assertIsNone(c.get(0.0))
+        c.update("Россельхознадзор обратился в прокуратуру", segment_end=8.0)
+        self.assertEqual(c.get(8.2), "Россельхознадзор обратился в прокуратуру")
+        self.assertIsNone(c.get(30.0))  # a long pause: do not carry the old topic over
+
+    def test_long_context_is_trimmed_at_a_word_boundary(self):
+        from teams_transcribe.whisper_stream import PromptContext
+
+        c = PromptContext(max_chars=20)
+        c.update("раз два три четыре пять шесть", segment_end=1.0)
+        tail = c.get(1.0)
+        self.assertLessEqual(len(tail), 20)
+        self.assertIn(tail, "раз два три четыре пять шесть")
+        self.assertTrue("раз два три четыре пять шесть".endswith(tail))
+        self.assertFalse(tail.startswith(("ре", "ять")))  # never a cut-off word
+
+    def test_prompt_echo_is_dropped_but_real_text_kept(self):
+        from teams_transcribe.whisper_stream import strip_prompt_echo
+
+        prompt = "Россельхознадзор обратился в прокуратуру"
+        self.assertEqual(strip_prompt_echo("обратился в прокуратуру", prompt), "")
+        self.assertEqual(strip_prompt_echo("Препарат отозвали до завершения расследования", prompt),
+                         "Препарат отозвали до завершения расследования")
+        self.assertEqual(strip_prompt_echo("да", prompt), "да")
+        self.assertEqual(strip_prompt_echo("текст", None), "текст")
+
+
+class WhisperStreamStopTests(unittest.TestCase):
+    class FakeEngine:
+        def __init__(self, delay, block=False):
+            self.delay, self.block, self.prompts = delay, block, []
+
+        def transcribe(self, audio, language, prompt=None):
+            import time
+
+            self.prompts.append(prompt)
+            if self.block:
+                time.sleep(30)
+            time.sleep(self.delay)
+            return "слово"
+
+    def _run(self, engine, stall_timeout, seconds=20, use_context=True):
+        from teams_transcribe.whisper_stream import WhisperStream
+
+        results = []
+        stream = WhisperStream(engine, language="ru", sample_rate=16000, use_context=use_context,
+                               on_result=lambda s, d, f, spk, t: results.append(t))
+        stream.start()
+        speech = (tone(seconds, amp=0.3) * 32767).astype(np.int16).tobytes()
+        for i in range(0, len(speech), 4096):
+            stream.send(speech[i:i + 4096])
+        import time
+
+        began = time.monotonic()
+        stream.stop(stall_timeout=stall_timeout)
+        return results, time.monotonic() - began
+
+    def test_stop_waits_for_the_whole_backlog(self):
+        engine = self.FakeEngine(delay=0.4)
+        results, waited = self._run(engine, stall_timeout=5.0)  # ~3 segments x 0.4 s, several seconds of lag overall
+        self.assertGreaterEqual(len(results), 3)
+        self.assertEqual(len(engine.prompts), len(results))
+        self.assertIsNone(engine.prompts[0])
+        self.assertTrue(all(p == "слово" for p in engine.prompts[1:]))  # context passed on
+
+    def test_context_is_off_by_default(self):
+        from teams_transcribe.whisper_stream import WhisperStream
+
+        engine = self.FakeEngine(delay=0)
+        stream = WhisperStream(engine, language="ru", sample_rate=16000, on_result=lambda *a: None)
+        stream.start()
+        speech = (tone(20, amp=0.3) * 32767).astype(np.int16).tobytes()
+        for i in range(0, len(speech), 4096):
+            stream.send(speech[i:i + 4096])
+        stream.stop()
+        self.assertGreaterEqual(len(engine.prompts), 2)
+        self.assertTrue(all(p is None for p in engine.prompts))
+
+    def test_stop_gives_up_on_a_stuck_recognizer(self):
+        results, waited = self._run(self.FakeEngine(delay=0, block=True), stall_timeout=1.0, seconds=9)
+        self.assertEqual(results, [])
+        self.assertLess(waited, 10)
+
+
 class ResamplerTests(unittest.TestCase):
     def test_48k_to_16k_length_and_chunk_continuity(self):
         x = tone(1.0, rate=48000)

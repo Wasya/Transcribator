@@ -10,6 +10,7 @@ class Settings:
     whisper_model: Optional[str]  # None = pick by device
     whisper_device: str  # "auto" | "cuda" | "cpu"
     whisper_compute_type: Optional[str]  # None = pick by device
+    whisper_use_context: bool = False  # pass previous text to Whisper as a prompt (experimental)
 
 
 def load_settings() -> Settings:
@@ -23,6 +24,7 @@ def load_settings() -> Settings:
         whisper_model=env("WHISPER_MODEL"),
         whisper_device=(env("WHISPER_DEVICE") or "auto").lower(),
         whisper_compute_type=env("WHISPER_COMPUTE_TYPE"),
+        whisper_use_context=(env("WHISPER_USE_CONTEXT") or "").lower() in ("1", "true", "yes", "on"),
     )
 
 

@@ -46,6 +46,7 @@ class SessionOptions:
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
     diarization: str = DIARIZE_POST
+    whisper_use_context: bool = False
 
 
 @dataclass
@@ -205,6 +206,7 @@ class TranscriptionSession:
             on_result=on_result, on_error=self._on_stream_error,
             speaker_identifier=self._identifier if diarize else None,
             label="system" if diarize else "mic",
+            use_context=self.options.whisper_use_context,
         )
 
     def start(self) -> None:

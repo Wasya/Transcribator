@@ -86,6 +86,7 @@ class App(tk.Tk):
         self._activity_text = ""
         self._activity_began: float | None = None
         self._tick_job = None
+        self._stopping_session: TranscriptionSession | None = None
         self._recording_began = 0.0
         self._heard_speech = False  # a recognized utterance has appeared in this session
         self._session: TranscriptionSession | None = None
@@ -355,7 +356,13 @@ class App(tk.Tk):
         if self._activity_began is None:
             return
         elapsed = int(time.monotonic() - self._activity_began)
-        self.status_var.set(f"{self._activity_text}  ({elapsed} с)")
+        text = f"{self._activity_text}  ({elapsed} с)"
+        stopping = self._stopping_session
+        if stopping is not None:
+            lag = stopping.backlog_seconds
+            if lag >= 1.0:
+                text += f" — осталось распознать {lag:.0f} с звука"
+        self.status_var.set(text)
         if reschedule:
             self._tick_job = self.after(500, self._tick_activity)
 
@@ -393,6 +400,7 @@ class App(tk.Tk):
                 "  pip install -r requirements-whisperx.txt\n(см. README)",
             )
             return None
+        opts.whisper_use_context = self._settings.whisper_use_context
         opts.diarization = DIARIZATION_MODES[self.diar_combo.current()][1]
         if opts.diarization != DIARIZE_OFF and not opts.hf_token:
             if not messagebox.askyesno(
@@ -515,6 +523,7 @@ class App(tk.Tk):
                     self._set_activity_text(payload)
                 elif kind == "stopped":
                     self._busy = False
+                    self._stopping_session = None
                     stop_error, diar_error = extra
                     self._finish_stop(payload, stop_error, diar_error)
         except queue.Empty:
@@ -530,6 +539,7 @@ class App(tk.Tk):
         self._recording = False
         self.stop_button.config(state="disabled")
         self.mute_button.config(state="disabled")
+        self._stopping_session = session
         self._begin_activity("Остановка, доработка последних реплик…")
 
         # session.stop() can block for a long time with WhisperX (it waits for
