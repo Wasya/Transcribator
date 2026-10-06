@@ -5,6 +5,10 @@ from typing import Optional
 
 SpeakerKey = tuple[str, Optional[int]]
 
+# Default pause (seconds) within which a speaker's next utterance still continues
+# the same line. The engines cut speech at every short pause, so this is generous.
+DEFAULT_MERGE_GAP = 6.0
+
 
 @dataclass
 class Utterance:
@@ -28,7 +32,7 @@ class TranscriptLine:
 
 
 def merge_utterances(
-    utterances: list[Utterance], *, max_gap: float = 3.0, max_seconds: float = 90.0
+    utterances: list[Utterance], *, max_gap: float = DEFAULT_MERGE_GAP, max_seconds: float = 90.0
 ) -> list[TranscriptLine]:
     """Group utterances into lines: the next utterance of the same speaker joins the
     current line when nobody else spoke in between and the pause is <= max_gap

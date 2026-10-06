@@ -2,6 +2,7 @@ import logging
 import math
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
@@ -13,7 +14,7 @@ from naming import build_timestamped_name
 from teams_transcribe.audio_capture import LevelMonitor, list_input_devices, list_loopback_devices
 from teams_transcribe.exporter import export_session
 from teams_transcribe.config import Settings, resolve_whisper_runtime
-from teams_transcribe.transcript_store import TranscriptStore, merge_utterances
+from teams_transcribe.transcript_store import DEFAULT_MERGE_GAP, TranscriptStore, merge_utterances
 from teams_transcribe.session import (
     BACKEND_DEEPGRAM,
     BACKEND_WHISPERX,
@@ -58,7 +59,6 @@ LANGUAGES = [
 ]
 
 LEVEL_FLOOR_DB = -60.0  # RMS at or below this shows as an empty meter
-DEFAULT_MERGE_GAP = 3.0  # seconds; see transcript_store.merge_utterances
 
 
 def level_to_percent(rms: float) -> int:
@@ -192,7 +192,7 @@ class App(tk.Tk):
         ttk.Label(merge_row, text="Не начинать новую реплику, если тот же голос молчал не дольше").pack(side="left")
         self.merge_gap_var = tk.DoubleVar(value=DEFAULT_MERGE_GAP)
         ttk.Spinbox(
-            merge_row, from_=0.0, to=15.0, increment=0.5, width=5, textvariable=self.merge_gap_var,
+            merge_row, from_=0.0, to=30.0, increment=0.5, width=5, textvariable=self.merge_gap_var,
             command=self._schedule_render,
         ).pack(side="left", padx=4)
         ttk.Label(merge_row, text="с (0 — каждая фраза отдельной строкой)").pack(side="left")
@@ -393,7 +393,9 @@ class App(tk.Tk):
 
         def prepare():
             try:
+                began = time.monotonic()
                 session.prepare()
+                log.info("models ready in %.1fs", time.monotonic() - began)
                 self._work_queue.put(("prepared", session, None))
             except Exception as exc:  # noqa: BLE001
                 log.exception("prepare failed")

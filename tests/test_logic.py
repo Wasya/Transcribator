@@ -1,6 +1,6 @@
 import unittest
 import unittest.mock
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 
@@ -260,6 +260,55 @@ class ModelCacheTests(unittest.TestCase):
             c = speaker_id.get_embedder("tok", "cuda")
         self.assertIs(a, b)
         self.assertIsNot(a, c)
+
+
+class MergeUtterancesTests(unittest.TestCase):
+    T0 = datetime(2026, 1, 1, 10, 0, 0)
+
+    def _u(self, key, offset, dur, text):
+        from teams_transcribe.transcript_store import Utterance
+
+        return Utterance(key, self.T0 + timedelta(seconds=offset), True, text, offset, dur)
+
+    def test_comma_pauses_of_one_speaker_form_one_line(self):
+        from teams_transcribe.transcript_store import merge_utterances
+
+        k = ("system", 0)
+        lines = merge_utterances([self._u(k, 0, 2, "Привет,"), self._u(k, 4.5, 2, "как дела"), self._u(k, 9, 1, "сегодня")])
+        self.assertEqual([l.text for l in lines], ["Привет, как дела сегодня"])  # 2.5 s and 2 s pauses
+
+    def test_other_speaker_in_between_splits_lines(self):
+        from teams_transcribe.transcript_store import merge_utterances
+
+        a, b = ("system", 0), ("system", 1)
+        lines = merge_utterances([self._u(a, 0, 2, "раз"), self._u(b, 2.5, 1, "два"), self._u(a, 4, 1, "три")])
+        self.assertEqual([l.text for l in lines], ["раз", "два", "три"])
+
+    def test_long_pause_starts_new_line_and_zero_disables_merging(self):
+        from teams_transcribe.transcript_store import DEFAULT_MERGE_GAP, merge_utterances
+
+        k = ("system", 0)
+        us = [self._u(k, 0, 1, "a"), self._u(k, 1 + DEFAULT_MERGE_GAP + 1, 1, "b")]
+        self.assertEqual(len(merge_utterances(us)), 2)
+        close = [self._u(k, 0, 1, "a"), self._u(k, 1.5, 1, "b")]
+        self.assertEqual(len(merge_utterances(close, max_gap=0)), 2)
+
+    def test_line_length_is_capped(self):
+        from teams_transcribe.transcript_store import merge_utterances
+
+        k = ("system", 0)
+        us = [self._u(k, i * 10, 9, f"w{i}") for i in range(12)]  # non-stop speech for 2 minutes
+        lines = merge_utterances(us, max_seconds=90)
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all((l.end - l.timestamp).total_seconds() <= 90 for l in lines))
+
+    def test_rename_relabels_every_earlier_line(self):
+        s = TranscriptStore()
+        k = ("system", 0)
+        s.get_or_create_system_speaker_name(0)
+        s.add_utterance(k, self.T0, True, "раз", 0, 1)
+        s.rename(k, "Иван")
+        self.assertEqual(s.speaker_name(s.final_utterances()[0].speaker_key), "Иван")
 
 
 if __name__ == "__main__":

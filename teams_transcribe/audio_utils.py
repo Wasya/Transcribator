@@ -51,6 +51,7 @@ class Segment:
     audio: np.ndarray  # float32, 16 kHz mono
     start: float  # seconds from the start of the stream's audio
     end: float
+    queued_at: float = 0.0  # time.monotonic() when it was handed to the recognizer (latency diagnostics)
 
 
 class Segmenter:

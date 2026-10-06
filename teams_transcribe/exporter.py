@@ -3,7 +3,7 @@ from pathlib import Path
 
 from naming import sanitize_name_component
 from teams_transcribe.echo_filter import find_mic_echo
-from teams_transcribe.transcript_store import TranscriptStore, merge_utterances
+from teams_transcribe.transcript_store import DEFAULT_MERGE_GAP, TranscriptStore, merge_utterances
 
 
 def export_session(
@@ -11,7 +11,7 @@ def export_session(
     output_dir: Path,
     *,
     drop_mic_echo: bool = True,
-    merge_gap: float = 3.0,
+    merge_gap: float = DEFAULT_MERGE_GAP,
 ) -> int:
     """Write transcript.txt, transcript.json and speakers/<Имя>.txt into output_dir.
 

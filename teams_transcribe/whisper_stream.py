@@ -1,10 +1,14 @@
 import gc
+import logging
 import queue
 import threading
+import time
 from datetime import datetime
 from typing import Callable, Optional
 
 from teams_transcribe.audio_utils import Resampler, Segmenter, pcm16_to_float32
+
+log = logging.getLogger("teams_transcribe")
 
 
 class WhisperEngine:
@@ -160,6 +164,7 @@ class WhisperStream:
             return self._backlog
 
     def _enqueue(self, segment) -> None:
+        segment.queued_at = time.monotonic()
         with self._backlog_lock:
             self._backlog += segment.end - segment.start
         self._jobs.put(segment)
@@ -189,7 +194,15 @@ class WhisperStream:
             if segment is None:
                 return
             try:
+                began = time.monotonic()
                 text = self._engine.transcribe(segment.audio, self._language)
+                done = time.monotonic()
+                # Where the delay goes: "wait" = queued behind other work, "decode" = the
+                # model itself; the pause that ended the utterance comes on top of both.
+                log.info(
+                    "whisper segment: audio=%.1fs wait=%.2fs decode=%.2fs chars=%d",
+                    segment.end - segment.start, began - segment.queued_at, done - began, len(text),
+                )
                 if not text:
                     continue
                 speaker_id = self._identifier(segment.audio) if self._identifier else None
