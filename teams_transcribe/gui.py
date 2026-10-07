@@ -18,10 +18,8 @@ from teams_transcribe.transcript_store import DEFAULT_MERGE_GAP, TranscriptStore
 from teams_transcribe.session import (
     BACKEND_DEEPGRAM,
     BACKEND_WHISPERX,
-    DIARIZE_BOTH,
     DIARIZE_LIVE,
     DIARIZE_OFF,
-    DIARIZE_POST,
     SessionOptions,
     TranscriptionSession,
 )
@@ -44,12 +42,6 @@ WHISPER_MODELS = [
     ("large-v3 — максимум качества", "large-v3"),
 ]
 
-DIARIZATION_MODES = [
-    ("После «Стоп» (вариант A, точнее)", DIARIZE_POST),
-    ("Во время звонка (вариант B)", DIARIZE_LIVE),
-    ("B во время звонка + A после «Стоп»", DIARIZE_BOTH),
-    ("Не разделять участников", DIARIZE_OFF),
-]
 
 LANGUAGES = [
     ("Русский", "ru"),
@@ -170,12 +162,11 @@ class App(tk.Tk):
         self.model_combo.current(0)
         self.model_combo.grid(row=4, column=1, sticky="w", padx=4)
 
-        ttk.Label(top, text="Разбор по голосам:").grid(row=5, column=0, sticky="w")
-        self.diar_combo = ttk.Combobox(
-            top, values=[label for label, _ in DIARIZATION_MODES], state="readonly", width=40
+        self.diar_var = tk.BooleanVar(value=True)
+        self.diar_check = ttk.Checkbutton(
+            top, text="Определять собеседников по голосу (WhisperX; у Deepgram это встроено)", variable=self.diar_var
         )
-        self.diar_combo.current(0)
-        self.diar_combo.grid(row=5, column=1, sticky="w", padx=4)
+        self.diar_check.grid(row=5, column=0, columnspan=2, sticky="w")
 
         ttk.Label(top, text="Имя сессии (опц.):").grid(row=6, column=0, sticky="w")
         self.session_name_var = tk.StringVar()
@@ -318,7 +309,7 @@ class App(tk.Tk):
         whisper = BACKENDS[self.backend_combo.current()][1] == BACKEND_WHISPERX
         state = "readonly" if whisper else "disabled"
         self.model_combo.config(state=state)
-        self.diar_combo.config(state=state)
+        self.diar_check.config(state="normal" if whisper else "disabled")
 
     def _set_status(self, text: str) -> None:
         """Static status text; also ends any running activity indicator."""
@@ -401,15 +392,8 @@ class App(tk.Tk):
             )
             return None
         opts.whisper_use_context = self._settings.whisper_use_context
-        opts.diarization = DIARIZATION_MODES[self.diar_combo.current()][1]
-        if opts.diarization != DIARIZE_OFF and not opts.hf_token:
-            if not messagebox.askyesno(
-                "Нет HF_TOKEN",
-                "Для разбора по голосам нужен токен Hugging Face (HF_TOKEN в .env, см. README).\n"
-                "Продолжить без разбора по голосам?",
-            ):
-                return None
-            opts.diarization = DIARIZE_OFF
+        # Voices are told apart while recording (variant B): it needs no Hugging Face token.
+        opts.diarization = DIARIZE_LIVE if self.diar_var.get() else DIARIZE_OFF
         model_override = WHISPER_MODELS[self.model_combo.current()][1]
         opts.whisper_model, opts.whisper_device, opts.whisper_compute_type = resolve_whisper_runtime(
             self._settings, model_override

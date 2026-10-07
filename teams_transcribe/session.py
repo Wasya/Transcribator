@@ -45,7 +45,7 @@ class SessionOptions:
     whisper_model: str = "small"
     whisper_device: str = "cpu"
     whisper_compute_type: str = "int8"
-    diarization: str = DIARIZE_POST
+    diarization: str = DIARIZE_LIVE
     whisper_use_context: bool = False
 
 
